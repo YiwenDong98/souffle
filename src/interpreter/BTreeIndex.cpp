@@ -32,7 +32,7 @@ Own<RelationWrapper> createBTreeRelation(
     switch (id.getArity()) {
         FOR_EACH_BTREE(CREATE_BTREE_REL);
 
-        default: fatal("Requested arity not yet supported. Feel free to add it.");
+        default: fatal("Requested arity %d not yet supported. Feel free to add it.", id.getArity());
     }
 }
 
