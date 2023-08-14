@@ -31,6 +31,7 @@
 #include "ast/StringConstant.h"
 #include "ast/TranslationUnit.h"
 #include "ast/UnnamedVariable.h"
+#include "ast/UserDefinedAggregator.h"
 #include "ast/analysis/IOType.h"
 #include "ast/analysis/PrecedenceGraph.h"
 #include "ast/analysis/SCCGraph.h"
@@ -93,14 +94,14 @@ std::set<QualifiedName> MagicSetTransformer::getWeaklyIgnoredRelations(const Tra
     std::set<QualifiedName> weaklyIgnoredRelations;
 
     // Add magic-transform-exclude relations to the weakly ignored set
-    for (const auto& relStr : splitString(Global::config().get("magic-transform-exclude"), ',')) {
+    for (const auto& relStr : splitString(tu.global().config().get("magic-transform-exclude"), ',')) {
         std::vector<std::string> qualifiers = splitString(relStr, '.');
         weaklyIgnoredRelations.insert(QualifiedName(qualifiers));
     }
 
     // Pick up specified relations from config
     std::set<QualifiedName> specifiedRelations;
-    for (const auto& relStr : splitString(Global::config().get("magic-transform"), ',')) {
+    for (const auto& relStr : splitString(tu.global().config().get("magic-transform"), ',')) {
         std::vector<std::string> qualifiers = splitString(relStr, '.');
         specifiedRelations.insert(QualifiedName(qualifiers));
     }
@@ -273,7 +274,7 @@ std::set<QualifiedName> MagicSetTransformer::getRelationsToNotLabel(const Transl
 
 bool MagicSetTransformer::shouldRun(const TranslationUnit& tu) {
     const Program& program = tu.getProgram();
-    if (Global::config().has("magic-transform")) return true;
+    if (tu.global().config().has("magic-transform")) return true;
     for (const auto* rel : program.getRelations()) {
         if (rel->hasQualifier(RelationQualifier::MAGIC)) return true;
     }
@@ -534,10 +535,20 @@ bool NormaliseDatabaseTransformer::normaliseArguments(TranslationUnit& translati
                 append(newBodyLiterals, cloneRange(subConstraints));
 
                 // Update the node to reflect normalised aggregator
-                node = aggr->getTargetExpression() != nullptr
-                               ? mk<Aggregator>(aggr->getBaseOperator(), clone(aggr->getTargetExpression()),
-                                         std::move(newBodyLiterals))
-                               : mk<Aggregator>(aggr->getBaseOperator(), nullptr, std::move(newBodyLiterals));
+                node = [&]() -> Own<Aggregator> {
+                    if (auto* intrinsicAggr = as<IntrinsicAggregator>(aggr)) {
+                        return mk<IntrinsicAggregator>(intrinsicAggr->getBaseOperator(),
+                                (aggr->getTargetExpression() != nullptr ? clone(aggr->getTargetExpression())
+                                                                        : nullptr),
+                                std::move(newBodyLiterals));
+                    } else {
+                        auto* uda = as<UserDefinedAggregator>(aggr);
+                        return mk<UserDefinedAggregator>(uda->getBaseOperatorName(), clone(uda->getInit()),
+                                (aggr->getTargetExpression() != nullptr ? clone(aggr->getTargetExpression())
+                                                                        : nullptr),
+                                std::move(newBodyLiterals));
+                    }
+                }();
             } else {
                 // Otherwise, just normalise children as usual.
                 node->apply(*this);

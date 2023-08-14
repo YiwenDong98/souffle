@@ -8,7 +8,10 @@
 set(SOUFFLE_SOURCES
     FunctorOps.cpp
     Global.cpp
+    MainDriver.cpp
     ast/Aggregator.cpp
+    ast/IntrinsicAggregator.cpp
+    ast/UserDefinedAggregator.cpp
     ast/AlgebraicDataType.cpp
     ast/AliasType.cpp
     ast/Atom.cpp
@@ -101,6 +104,7 @@ set(SOUFFLE_SOURCES
     ast/transform/ResolveAliases.cpp
     ast/transform/ResolveAnonymousRecordAliases.cpp
     ast/transform/SemanticChecker.cpp
+    ast/transform/SimplifyConstantBinaryConstraints.cpp
     ast/transform/SubsumptionQualifier.cpp
     ast/transform/SimplifyAggregateTargetExpression.cpp
     ast/transform/Transformer.cpp
@@ -133,6 +137,7 @@ set(SOUFFLE_SOURCES
     parser/ParserDriver.cpp
     parser/ParserUtils.cpp
     parser/SrcLocation.cpp
+    parser/VirtualFileSystem.cpp
     ram/Node.cpp
     ram/TranslationUnit.cpp
     ram/analysis/Complexity.cpp
@@ -153,6 +158,7 @@ set(SOUFFLE_SOURCES
     ram/transform/Transformer.cpp
     ram/transform/TupleId.cpp
     ram/utility/NodeMapper.cpp
+    reports/ErrorReport.cpp
     reports/DebugReport.cpp
     synthesiser/Synthesiser.cpp
     synthesiser/Relation.cpp
@@ -178,6 +184,9 @@ if (MSVC)
              COMPILE_FLAGS "/wd4005 /wd4996")
   set_source_files_properties(${CMAKE_CURRENT_BINARY_DIR}/parser/parser.cc PROPERTIES
              COMPILE_FLAGS "/wd4005 /wd26819")
+elseif (EMSCRIPTEN)
+  set_source_files_properties(${CMAKE_CURRENT_BINARY_DIR}/parser/parser.cc PROPERTIES
+             COMPILE_FLAGS "-Wno-error=unused-but-set-variable")
 else ()
   # OSX compiler doesn't recognise `(void)var;` ideom
   set_source_files_properties(${CMAKE_CURRENT_BINARY_DIR}/parser/scanner.cc PROPERTIES
@@ -214,7 +223,10 @@ target_compile_features(libsouffle PUBLIC cxx_std_17)
 target_compile_features(compiled PUBLIC cxx_std_17)
 
 set_target_properties(libsouffle PROPERTIES CXX_EXTENSIONS OFF)
+set_target_properties(libsouffle PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 set_target_properties(compiled PROPERTIES CXX_EXTENSIONS OFF)
+set_target_properties(compiled PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if (NOT MSVC)
   target_compile_options(libsouffle PUBLIC -Wall -Wextra -Werror -fwrapv)
@@ -309,9 +321,14 @@ set_target_properties(libsouffle PROPERTIES OUTPUT_NAME "souffle")
 # Souffle binary
 # --------------------------------------------------
 add_executable(souffle
-               main.cpp)
+               souffle.cpp)
 target_link_libraries(souffle libsouffle)
 install(TARGETS souffle DESTINATION bin)
+
+if (EMSCRIPTEN)
+target_link_libraries(souffle -sMODULARIZE=1
+                      -s'EXPORTED_RUNTIME_METHODS=["FS"]' -sEXPORT_NAME="SOUFFLE")
+endif()
 
 # Copy the dlls in the same directory as Souffle so that they will
 # be immediately found by the operating system.

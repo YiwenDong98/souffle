@@ -34,6 +34,7 @@
 #include "ast/analysis/typesystem/PolymorphicObjects.h"
 #include "ast/analysis/typesystem/SumTypeBranches.h"
 #include "ast/analysis/typesystem/Type.h"
+#include "ast/analysis/typesystem/TypeConstraints.h"
 #include "ast/analysis/typesystem/TypeEnvironment.h"
 #include "ast/analysis/typesystem/TypeSystem.h"
 #include "ast/utility/Utils.h"
@@ -124,7 +125,7 @@ private:
     /* Type checks */
     /** Check if declared types of the relation match deduced types. */
     void visit_(type_identity<Atom>, const Atom& atom) override;
-    void visit_(type_identity<Variable>, const Variable& var) override;
+    void visit_(type_identity<souffle::ast::Variable>, const souffle::ast::Variable& var) override;
     void visit_(type_identity<StringConstant>, const StringConstant& constant) override;
     void visit_(type_identity<NumericConstant>, const NumericConstant& constant) override;
     void visit_(type_identity<NilConstant>, const NilConstant& constant) override;
@@ -134,7 +135,8 @@ private:
     void visit_(type_identity<IntrinsicFunctor>, const IntrinsicFunctor& fun) override;
     void visit_(type_identity<UserDefinedFunctor>, const UserDefinedFunctor& fun) override;
     void visit_(type_identity<BinaryConstraint>, const BinaryConstraint& constraint) override;
-    void visit_(type_identity<Aggregator>, const Aggregator& aggregator) override;
+    void visit_(type_identity<IntrinsicAggregator>, const IntrinsicAggregator& aggregator) override;
+    void visit_(type_identity<UserDefinedAggregator>, const UserDefinedAggregator& aggregator) override;
 };  // namespace souffle::ast::transform
 
 void TypeChecker::verify(TranslationUnit& tu) {
@@ -366,7 +368,7 @@ void TypeCheckerImpl::visit_(type_identity<Atom>, const Atom& atom) {
                 return isA<analysis::RecordType>(type) && !isA<analysis::SubsetType>(type);
             });
 
-            if (!validAttribute && !Global::config().has("legacy")) {
+            if (!validAttribute && !tu.global().config().has("legacy")) {
                 auto primaryDiagnostic =
                         DiagnosticMessage("Atom's argument type is not a subtype of its declared type",
                                 arguments[i]->getSrcLoc());
@@ -382,10 +384,12 @@ void TypeCheckerImpl::visit_(type_identity<Atom>, const Atom& atom) {
             // Declared attribute and deduced type agree if:
             // They are the same type, or
             // They are derived from the same constant type.
+            // They are equivalent types.
             bool validAttribute = all_of(argTypes, [&](const analysis::Type& type) {
-                return type == attributeType || any_of(typeEnv.getConstantTypes(), [&](auto& constantType) {
-                    return isSubtypeOf(attributeType, constantType) && isSubtypeOf(type, constantType);
-                });
+                return type == attributeType || areEquivalentTypes(type, attributeType) ||
+                       any_of(typeEnv.getConstantTypes(), [&](auto& constantType) {
+                           return isSubtypeOf(attributeType, constantType) && isSubtypeOf(type, constantType);
+                       });
             });
 
             if (!validAttribute) {
@@ -402,9 +406,14 @@ void TypeCheckerImpl::visit_(type_identity<Atom>, const Atom& atom) {
     }
 }
 
-void TypeCheckerImpl::visit_(type_identity<Variable>, const ast::Variable& var) {
+void TypeCheckerImpl::visit_(type_identity<souffle::ast::Variable>, const ast::Variable& var) {
     if (typeAnalysis.getTypes(&var).empty()) {
-        report.addError("Unable to deduce type for variable " + var.getName(), var.getSrcLoc());
+        if (typeAnalysis.errorAnalyzer) {
+            typeAnalysis.errorAnalyzer->explain(
+                    report, &var, "Unable to deduce type for variable " + var.getName());
+        } else {
+            report.addError("Unable to deduce type for variable " + var.getName(), var.getSrcLoc());
+        }
     }
 }
 
@@ -665,7 +674,7 @@ void TypeCheckerImpl::visit_(type_identity<BinaryConstraint>, const BinaryConstr
     }
 }
 
-void TypeCheckerImpl::visit_(type_identity<Aggregator>, const Aggregator& aggregator) {
+void TypeCheckerImpl::visit_(type_identity<IntrinsicAggregator>, const IntrinsicAggregator& aggregator) {
     auto op = polyAnalysis.getOverloadedOperator(aggregator);
 
     auto aggregatorType = typeAnalysis.getTypes(&aggregator);
@@ -676,6 +685,11 @@ void TypeCheckerImpl::visit_(type_identity<Aggregator>, const Aggregator& aggreg
     if (!isOfKind(aggregatorType, opType)) {
         report.addError("Couldn't assign types to the aggregator", aggregator.getSrcLoc());
     }
+}
+
+void TypeCheckerImpl::visit_(type_identity<UserDefinedAggregator>, const UserDefinedAggregator& aggregator) {
+    // TODO
+    /*const TypeSet& resultTypes =*/typeAnalysis.getTypes(&aggregator);
 }
 
 void TypeCheckerImpl::visit_(type_identity<Negation>, const Negation& neg) {

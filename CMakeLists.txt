@@ -6,6 +6,8 @@
 
 cmake_minimum_required(VERSION 3.15)
 
+set(CMAKE_CXX_STANDARD 17)
+
 include(CMakeDependentOption)
 
 option(SOUFFLE_GIT "Enable/Disable git completion" ON)
@@ -139,6 +141,15 @@ if (WIN32)
   SET( CMAKE_ARCHIVE_OUTPUT_DIRECTORY_RELEASE "${OUTPUT_DIRECTORY}")
 endif ()
 
+
+if(EMSCRIPTEN)
+  set(SOUFFLE_USE_SQLITE off)
+  set(SOUFFLE_USE_OPENMP off)
+  set(SOUFFLE_USE_ZLIB off)
+  set(SOUFFLE_USE_LIBFFI off)
+  set(SOUFFLE_USE_CURSES off)
+  set(SOUFFLE_ENABLE_TESTING off)
+endif ()
 # --------------------------------------------------
 # curses libraries for Provenance information
 # --------------------------------------------------

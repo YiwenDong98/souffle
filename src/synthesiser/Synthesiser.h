@@ -29,6 +29,7 @@
 #include <map>
 #include <memory>
 #include <ostream>
+#include <regex>
 #include <set>
 #include <string>
 
@@ -43,6 +44,9 @@ private:
 
     /** RAM translation unit */
     ram::TranslationUnit& translationUnit;
+
+    /** Global */
+    Global& glb;
 
     /** RAM identifier to C++ identifier map */
     std::map<const std::string, const std::string> identifiers;
@@ -72,6 +76,12 @@ private:
     bool SubroutineUsingStdRegex = false;
     bool SubroutineUsingSubstr = false;
 
+    /** A mapping of valid regex patterns to to a unique index.
+     * The index to which the pattern is mapped is in
+     *  the range from 0 regexes.size()-1.
+     */
+    std::map<std::string, std::size_t> regexes;
+
     /** Pointer to the subroutine class currently being built */
     GenClass* currentClass = nullptr;
 
@@ -80,6 +90,9 @@ private:
 
     /** signatures of the user-defined functors */
     std::map<std::string, std::pair<std::vector<std::string>, std::string>> functor_signatures;
+
+    /** Output relations */
+    std::set<std::string> storeRelations;
 
 protected:
     /** Convert RAM identifier */
@@ -100,6 +113,9 @@ protected:
 
     /** Get referenced relations */
     ram::RelationSet getReferencedRelations(const ram::Operation& op);
+
+    /** Compile a regular expression and return a unique name for it */
+    std::optional<std::size_t> compileRegex(const std::string& pattern);
 
     /** Generate code */
     void emitCode(std::ostream& out, const ram::Statement& stmt);
@@ -139,8 +155,7 @@ protected:
     std::set<std::string> accessedUserDefinedFunctors(ram::Statement& stmt);
 
 public:
-    explicit Synthesiser(/*const std::size_t laneCount, */ ram::TranslationUnit& tUnit)
-            : /*recordTable(laneCount),*/ translationUnit(tUnit) {
+    explicit Synthesiser(ram::TranslationUnit& tUnit) : translationUnit(tUnit), glb(tUnit.global()) {
         visit(tUnit.getProgram(),
                 [&](const ram::Relation& relation) { relationMap[relation.getName()] = &relation; });
     }

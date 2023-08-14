@@ -27,6 +27,7 @@
 #include "souffle/RamTypes.h"
 #include "souffle/RecordTable.h"
 #include "souffle/SymbolTable.h"
+#include "souffle/datastructure/ConcurrentCache.h"
 #include "souffle/datastructure/RecordTableImpl.h"
 #include "souffle/datastructure/SymbolTableImpl.h"
 #include "souffle/utility/ContainerUtil.h"
@@ -35,6 +36,7 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <regex>
 #include <string>
 #include <vector>
 #ifdef _OPENMP
@@ -55,13 +57,23 @@ class Engine {
     friend NodeGenerator;
 
 public:
-    Engine(ram::TranslationUnit& tUnit);
+    Engine(ram::TranslationUnit& tUnit, const std::size_t numThreads);
 
     /** @brief Execute the main program */
     void executeMain();
+
     /** @brief Execute the subroutine program */
     void executeSubroutine(
             const std::string& name, const std::vector<RamDomain>& args, std::vector<RamDomain>& ret);
+
+    /** @brief Return the global object this engine uses */
+    Global& getGlobal();
+
+    /** @brief Return the string symbol table */
+    SymbolTable& getSymbolTable();
+
+    /** @brief Return the record table */
+    RecordTable& getRecordTable();
 
 private:
     /** @brief Generate intermediate representation from RAM */
@@ -72,15 +84,9 @@ private:
     void swapRelation(const std::size_t ramRel1, const std::size_t ramRel2);
     /** @brief Return a reference to the relation on the given index */
     RelationHandle& getRelationHandle(const std::size_t idx);
-    /** @brief Return the string symbol table */
-    SymbolTable& getSymbolTable() {
-        return symbolTable;
-    }
-    /** @brief Return the record table */
-    RecordTable& getRecordTable();
     /** @brief Return the ram::TranslationUnit */
     ram::TranslationUnit& getTranslationUnit();
-    /** @brief Execute the program */
+    /** @brief Execute a specific node program */
     RamDomain execute(const Node*, Context&);
     /** @brief Return method handler */
     void* getMethodHandle(const std::string& method);
@@ -138,9 +144,12 @@ private:
     RamDomain evalParallelIndexIfExists(const Rel& rel, const ram::ParallelIndexIfExists& cur,
             const ParallelIndexIfExists& shadow, Context& ctxt);
 
-    template <typename Aggregate, typename Iter>
-    RamDomain evalAggregate(const Aggregate& aggregate, const Node& filter, const Node* expression,
-            const Node& nestedOperation, const Iter& ranges, Context& ctxt);
+    template <typename Shadow>
+    RamDomain initValue(const ram::Aggregator& aggregator, const Shadow& shadow, Context& ctxt);
+
+    template <typename Aggregate, typename Shadow, typename Iter>
+    RamDomain evalAggregate(
+            const Aggregate& aggregate, const Shadow& shadow, const Iter& ranges, Context& ctxt);
 
     template <typename Rel>
     RamDomain evalParallelAggregate(const Rel& rel, const ram::ParallelAggregate& cur,
@@ -162,6 +171,10 @@ private:
     template <typename Rel>
     RamDomain evalErase(Rel& rel, const Erase& shadow, Context& ctxt);
 
+    /** Program */
+    ram::TranslationUnit& tUnit;
+    /** Global */
+    Global& global;
     /** If profile is enable in this program */
     const bool profileEnabled;
     const bool frequencyCounterEnabled;
@@ -181,8 +194,6 @@ private:
     std::map<std::string, std::atomic<std::size_t>> reads;
     /** DLL */
     std::vector<void*> dll;
-    /** Program */
-    ram::TranslationUnit& tUnit;
     /** IndexAnalysis */
     ram::analysis::IndexAnalysis& isa;
     /** Record Table Implementation*/
@@ -191,6 +202,8 @@ private:
     VecOwn<RelationHandle> relations;
     /** Symbol table */
     SymbolTableImpl symbolTable;
+    /** A cache for regexes */
+    ConcurrentCache<std::string, std::regex> regexCache;
 };
 
 }  // namespace souffle::interpreter

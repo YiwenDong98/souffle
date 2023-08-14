@@ -13,6 +13,7 @@
  ***********************************************************************/
 
 #include "ast/analysis/typesystem/TypeConstrainsAnalysis.h"
+#include "ast/UserDefinedAggregator.h"
 #include "ast/analysis/typesystem/TypeConstraints.h"
 
 namespace souffle::ast::analysis {
@@ -38,7 +39,11 @@ void TypeConstraintsAnalysis::visit_(type_identity<Atom>, const Atom& atom) {
     }
 
     iterateOverAtom(atom, [&](const Argument& argument, const Type& attributeType) {
-        addConstraint(isSubtypeOf(getVar(argument), attributeType));
+        auto constraint = isSubtypeOf(getVar(argument), attributeType);
+        addConstraint(constraint);
+        if (errorAnalyzer) {
+            errorAnalyzer->localizeConstraint(constraint, atom.getSrcLoc());
+        }
     });
 }
 
@@ -231,7 +236,7 @@ void TypeConstraintsAnalysis::visit_(type_identity<BranchInit>, const BranchInit
     }
 }
 
-void TypeConstraintsAnalysis::visit_(type_identity<Aggregator>, const Aggregator& agg) {
+void TypeConstraintsAnalysis::visit_(type_identity<IntrinsicAggregator>, const IntrinsicAggregator& agg) {
     if (agg.getBaseOperator() == AggregateOp::COUNT) {
         addConstraint(isSubtypeOf(getVar(agg), typeEnv.getConstantType(TypeAttribute::Signed)));
     } else if (agg.getBaseOperator() == AggregateOp::MEAN) {
@@ -245,6 +250,17 @@ void TypeConstraintsAnalysis::visit_(type_identity<Aggregator>, const Aggregator
         addConstraint(isSubtypeOf(getVar(expr), getVar(agg)));
         addConstraint(isSubtypeOf(getVar(agg), getVar(expr)));
     }
+}
+
+void TypeConstraintsAnalysis::visit_(type_identity<UserDefinedAggregator>, const UserDefinedAggregator& agg) {
+    auto const& init = agg.getInit();
+
+    Type const& returnType = typeAnalysis.getAggregatorReturnType(agg);
+    addConstraint(isSubtypeOf(getVar(init), returnType));
+    addConstraint(isSubtypeOf(getVar(agg), returnType));
+
+    Type const& argType = typeAnalysis.getAggregatorParamType(agg, 1);
+    addConstraint(isSubtypeOf(getVar(agg.getTargetExpression()), argType));
 }
 
 void TypeConstraintsAnalysis::iterateOverAtom(

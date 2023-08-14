@@ -21,6 +21,7 @@
 #include "ast/BranchInit.h"
 #include "ast/Clause.h"
 #include "ast/Constant.h"
+#include "ast/IntrinsicAggregator.h"
 #include "ast/IntrinsicFunctor.h"
 #include "ast/NilConstant.h"
 #include "ast/NumericConstant.h"
@@ -48,6 +49,7 @@
 #include "ram/FloatConstant.h"
 #include "ram/GuardedInsert.h"
 #include "ram/Insert.h"
+#include "ram/IntrinsicAggregator.h"
 #include "ram/LogRelationTimer.h"
 #include "ram/Negation.h"
 #include "ram/NestedIntrinsicOperator.h"
@@ -59,7 +61,9 @@
 #include "ram/TupleElement.h"
 #include "ram/UnpackRecord.h"
 #include "ram/UnsignedConstant.h"
+#include "ram/UserDefinedAggregator.h"
 #include "ram/utility/Utils.h"
+#include "souffle/TypeAttribute.h"
 #include "souffle/utility/StringUtil.h"
 #include <map>
 #include <unordered_set>
@@ -112,7 +116,7 @@ Own<ram::Statement> ClauseTranslator::translateRecursiveClause(
     Own<ram::Statement> rule = translateNonRecursiveClause(clause);
 
     // Add logging
-    if (Global::config().has("profile")) {
+    if (context.getGlobal()->config().has("profile")) {
         const std::string& relationName = getConcreteRelationName(clause.getHead()->getQualifiedName());
         const auto& srcLocation = clause.getSrcLoc();
         const std::string clauseText = stringify(toString(clause));
@@ -234,7 +238,7 @@ Own<ram::Operation> ClauseTranslator::addAtomScan(Own<ram::Operation> op, const 
         }
 
         std::stringstream ss;
-        if (Global::config().has("profile")) {
+        if (context.getGlobal()->config().has("profile")) {
             ss << "@frequency-atom" << ';';
             ss << clause.getHead()->getQualifiedName() << ';';
             ss << version << ';';
@@ -381,10 +385,23 @@ Own<ram::Operation> ClauseTranslator::instantiateAggregator(Own<ram::Operation> 
     const auto* aggExpr = agg->getTargetExpression();
     auto expr = aggExpr ? context.translateValue(*valueIndex, aggExpr) : nullptr;
 
+    auto aggregator = [&]() -> Own<ram::Aggregator> {
+        if (const auto* ia = as<ast::IntrinsicAggregator>(agg)) {
+            return mk<ram::IntrinsicAggregator>(context.getOverloadedAggregatorOperator(*ia));
+        } else if (const auto* uda = as<ast::UserDefinedAggregator>(agg)) {
+            return mk<ram::UserDefinedAggregator>(uda->getBaseOperatorName(),
+                    context.translateValue(*valueIndex, uda->getInit()),
+                    context.getFunctorParamTypeAtributes(*uda), context.getFunctorReturnTypeAttribute(*uda),
+                    context.isStatefulFunctor(*uda));
+        } else {
+            fatal("Unhandled aggregate operation");
+        }
+    }();
+
     // add Ram-Aggregation layer
-    return mk<ram::Aggregate>(std::move(op), context.getOverloadedAggregatorOperator(*agg),
-            getClauseAtomName(clause, aggAtom), expr ? std::move(expr) : mk<ram::UndefValue>(),
-            aggCond ? std::move(aggCond) : mk<ram::True>(), curLevel);
+    return mk<ram::Aggregate>(std::move(op), std::move(aggregator), getClauseAtomName(clause, aggAtom),
+            expr ? std::move(expr) : mk<ram::UndefValue>(), aggCond ? std::move(aggCond) : mk<ram::True>(),
+            curLevel);
 }
 
 Own<ram::Operation> ClauseTranslator::instantiateMultiResultFunctor(

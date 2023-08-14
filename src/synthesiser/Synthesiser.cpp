@@ -20,8 +20,10 @@
 #include "GenDb.h"
 #include "Global.h"
 #include "RelationTag.h"
+#include "config.h"
 #include "ram/AbstractParallel.h"
 #include "ram/Aggregate.h"
+#include "ram/Aggregator.h"
 #include "ram/AutoIncrement.h"
 #include "ram/Break.h"
 #include "ram/Call.h"
@@ -83,6 +85,7 @@
 #include "ram/UndefValue.h"
 #include "ram/UnpackRecord.h"
 #include "ram/UnsignedConstant.h"
+#include "ram/UserDefinedAggregator.h"
 #include "ram/UserDefinedOperator.h"
 #include "ram/analysis/Index.h"
 #include "ram/utility/Utils.h"
@@ -207,24 +210,40 @@ ram::RelationSet Synthesiser::getReferencedRelations(const Operation& op) {
     return res;
 }
 
+std::optional<std::size_t> Synthesiser::compileRegex(const std::string& pattern) {
+    auto i = regexes.find(pattern);
+    if (i != regexes.end()) {
+        return i->second;
+    }
+    try {
+        const std::regex regex(pattern);
+        std::size_t index = regexes.size();
+        return regexes.emplace(pattern, index).first->second;
+    } catch (const std::exception&) {
+        std::cerr << "warning: wrong pattern provided \"" << pattern << "\"\n";
+        return std::nullopt;
+    }
+}
+
 void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
     class CodeEmitter : public ram::Visitor<void, Node const, std::ostream&> {
         using ram::Visitor<void, Node const, std::ostream&>::visit_;
 
     private:
         Synthesiser& synthesiser;
+        Global& glb;
         IndexAnalysis* const isa = &synthesiser.getTranslationUnit().getAnalysis<IndexAnalysis>();
 
 // macros to add comments to generated code for debugging
 #ifndef PRINT_BEGIN_COMMENT
-#define PRINT_BEGIN_COMMENT(os)                                                  \
-    if (Global::config().has("debug-report") || Global::config().has("verbose")) \
+#define PRINT_BEGIN_COMMENT(os)                                          \
+    if (glb.config().has("debug-report") || glb.config().has("verbose")) \
     os << "/* BEGIN " << __FUNCTION__ << " @" << __FILE__ << ":" << __LINE__ << " */\n"
 #endif
 
 #ifndef PRINT_END_COMMENT
-#define PRINT_END_COMMENT(os)                                                    \
-    if (Global::config().has("debug-report") || Global::config().has("verbose")) \
+#define PRINT_END_COMMENT(os)                                            \
+    if (glb.config().has("debug-report") || glb.config().has("verbose")) \
     os << "/* END " << __FUNCTION__ << " @" << __FILE__ << ":" << __LINE__ << " */\n"
 #endif
 
@@ -236,7 +255,7 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
         bool preambleIssued = false;
 
     public:
-        CodeEmitter(Synthesiser& syn) : synthesiser(syn) {
+        CodeEmitter(Synthesiser& syn) : synthesiser(syn), glb(synthesiser.glb) {
             rec = [&](auto& out, const auto* value) {
                 out << "ramBitCast(";
                 dispatch(*value, out);
@@ -315,6 +334,8 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
         void visit_(type_identity<IO>, const IO& io, std::ostream& out) override {
             PRINT_BEGIN_COMMENT(out);
 
+            synthesiser.currentClass->addInclude("\"souffle/io/IOSystem.h\"", true);
+
             // print directives as C++ initializers
             auto printDirectives = [&](const std::map<std::string, std::string>& registry) {
                 auto cur = registry.begin();
@@ -349,13 +370,16 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
                 out << "} catch (std::exception& e) {std::cerr << \"Error loading " << io.getRelation()
                     << " data: \" << e.what() "
                        "<< "
-                       "'\\n';}\n";
+                       "'\\n';\nexit(1);\n}\n";
             } else if (op == "output" || op == "printsize") {
                 out << "try {";
                 out << "std::map<std::string, std::string> directiveMap(";
                 printDirectives(directives);
                 out << ");\n";
-                out << R"_(if (!outputDirectory.empty()) {)_";
+                out << R"_(if (outputDirectory == "-"){)_";
+                out << R"_(directiveMap["IO"] = "stdout"; directiveMap["headers"] = "true";)_";
+                out << "}\n";
+                out << R"_(else if (!outputDirectory.empty()) {)_";
                 out << R"_(directiveMap["output-dir"] = outputDirectory;)_";
                 out << "}\n";
                 out << "IOSystem::getInstance().getWriter(";
@@ -464,11 +488,16 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
         void visit_(type_identity<Clear>, const Clear& clear, std::ostream& out) override {
             PRINT_BEGIN_COMMENT(out);
 
-            if (!synthesiser.lookup(clear.getRelation())->isTemp()) {
+            auto Relation = synthesiser.lookup(clear.getRelation());
+            bool isIntermediate =
+                    !contains(synthesiser.storeRelations, Relation->getName()) && !Relation->isTemp();
+
+            if (isIntermediate) {
                 out << "if (pruneImdtRels) ";
             }
-            out << synthesiser.getRelationName(synthesiser.lookup(clear.getRelation())) << "->"
-                << "purge();\n";
+            if (Relation->isTemp() || isIntermediate) {
+                out << synthesiser.getRelationName(Relation) << "->purge();\n";
+            }
 
             PRINT_END_COMMENT(out);
         }
@@ -579,7 +608,7 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
             // create local scope for name resolution
             out << "{\n";
 
-            const std::string ext = fileExtension(Global::config().get("profile"));
+            const std::string ext = fileExtension(glb.config().get("profile"));
 
             const auto* rel = synthesiser.lookup(timer.getRelation());
             auto relName = synthesiser.getRelationName(rel);
@@ -599,7 +628,7 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
             // create local scope for name resolution
             out << "{\n";
 
-            const std::string ext = fileExtension(Global::config().get("profile"));
+            const std::string ext = fileExtension(glb.config().get("profile"));
 
             // create local timer
             out << "\tLogger logger(R\"_(" << timer.getMessage() << ")_\",iter);\n";
@@ -627,7 +656,7 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
         void visit_(
                 type_identity<NestedOperation>, const NestedOperation& nested, std::ostream& out) override {
             dispatch(nested.getOperation(), out);
-            if (Global::config().has("profile") && Global::config().has("profile-frequency") &&
+            if (glb.config().has("profile") && glb.config().has("profile-frequency") &&
                     !nested.getProfileText().empty()) {
                 out << "freqs[" << synthesiser.lookupFreqIdx(nested.getProfileText()) << "]++;\n";
             }
@@ -1073,6 +1102,151 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
             PRINT_END_COMMENT(out);
         }
 
+        std::string initValue(const Aggregator& aggregator) {
+            if (const auto* ia = as<ram::IntrinsicAggregator>(aggregator)) {
+                switch (ia->getFunction()) {
+                    case AggregateOp::MIN: return "MAX_RAM_SIGNED";
+                    case AggregateOp::FMIN: return "MAX_RAM_FLOAT";
+                    case AggregateOp::UMIN: return "MAX_RAM_UNSIGNED";
+                    case AggregateOp::MAX: return "MIN_RAM_SIGNED";
+                    case AggregateOp::FMAX: return "MIN_RAM_FLOAT";
+                    case AggregateOp::UMAX: return "MIN_RAM_UNSIGNED";
+                    case AggregateOp::COUNT:
+                    case AggregateOp::MEAN:
+                    case AggregateOp::FSUM:
+                    case AggregateOp::USUM:
+                    case AggregateOp::SUM: return "0";
+                }
+            } else if (const auto* uda = as<ram::UserDefinedAggregator>(aggregator)) {
+                assert(uda);
+                std::stringstream ss;
+                dispatch(*uda->getInitValue(), ss);
+                return ss.str();
+            }
+            fatal("Unhandled aggregate operation");
+        }
+
+        void updateRes(std::ostream& out, const AbstractAggregate& aggregate) {
+            const auto& aggregator = aggregate.getAggregator();
+            if (const auto* ia = as<ram::IntrinsicAggregator>(aggregator)) {
+                AggregateOp aggregateFun = ia->getFunction();
+                std::string type = getType(aggregator);
+                switch (aggregateFun) {
+                    case AggregateOp::FMIN:
+                    case AggregateOp::UMIN:
+                    case AggregateOp::MIN:
+                        out << "res0 = std::min(res0,ramBitCast<" << type << ">(";
+                        dispatch(aggregate.getExpression(), out);
+                        out << "));\n";
+                        break;
+                    case AggregateOp::FMAX:
+                    case AggregateOp::UMAX:
+                    case AggregateOp::MAX:
+                        out << "res0 = std::max(res0,ramBitCast<" << type << ">(";
+                        dispatch(aggregate.getExpression(), out);
+                        out << "));\n";
+                        break;
+                    case AggregateOp::COUNT: out << "++res0\n;"; break;
+                    case AggregateOp::FSUM:
+                    case AggregateOp::USUM:
+                    case AggregateOp::SUM:
+                        out << "res0 += "
+                            << "ramBitCast<" << type << ">(";
+                        dispatch(aggregate.getExpression(), out);
+                        out << ");\n";
+                        break;
+
+                    case AggregateOp::MEAN:
+                        out << "res0 += "
+                            << "ramBitCast<RamFloat>(";
+                        dispatch(aggregate.getExpression(), out);
+                        out << ");\n";
+                        out << "++res1;\n";
+                        break;
+                }
+            } else if (const auto* uda = as<ram::UserDefinedAggregator>(aggregator)) {
+                out << "res0 = " << uda->getName() << "(";
+                if (uda->isStateful()) {
+                    out << "&symTable, &recordTable, ";
+                }
+                out << "res0, ";
+                dispatch(aggregate.getExpression(), out);
+                out << ");\n";
+            }
+        }
+
+        bool shouldRunNested(const Aggregator& aggregator) {
+            if (const auto* ia = as<ram::IntrinsicAggregator>(aggregator)) {
+                switch (ia->getFunction()) {
+                    case AggregateOp::COUNT:
+                    case AggregateOp::FSUM:
+                    case AggregateOp::USUM:
+                    case AggregateOp::SUM: return true;
+                    default: return false;
+                }
+            } else if (isA<ram::UserDefinedAggregator>(aggregator)) {
+                return false;
+            }
+            fatal("Unhandled aggregate operation");
+        }
+
+        std::string getType(const Aggregator& aggregator) {
+            auto str = [&](souffle::TypeAttribute ta) {
+                switch (ta) {
+                    case TypeAttribute::Signed: return "RamSigned";
+                    case TypeAttribute::Unsigned: return "RamUnsigned";
+                    case TypeAttribute::Float: return "RamFloat";
+                    case TypeAttribute::Symbol:
+                    case TypeAttribute::ADT:
+                    case TypeAttribute::Record: return "RamDomain";
+                    default: return "RamDomain";
+                }
+            };
+            if (const auto* ia = as<ram::IntrinsicAggregator>(aggregator)) {
+                return str(getTypeAttributeAggregate(ia->getFunction()));
+            } else if (const auto* uda = as<ram::UserDefinedAggregator>(aggregator)) {
+                return str(uda->getReturnType());
+            }
+            fatal("Unhandled aggregator");
+        }
+
+        std::tuple<std::string, std::string, int> reductionOperation(const Aggregator& aggregator) {
+            if (const auto* ia = as<ram::IntrinsicAggregator>(aggregator)) {
+                switch (ia->getFunction()) {
+                    case AggregateOp::MIN:
+                    case AggregateOp::FMIN:
+                    case AggregateOp::UMIN: return std::make_tuple("min", "", 200805);
+                    case AggregateOp::MAX:
+                    case AggregateOp::FMAX:
+                    case AggregateOp::UMAX: return std::make_tuple("max", "", 200805);
+                    case AggregateOp::MEAN:
+                    case AggregateOp::FSUM:
+                    case AggregateOp::USUM:
+                    case AggregateOp::COUNT:
+                    case AggregateOp::SUM: return std::make_tuple("+", "", 0);
+                    default: fatal("Unhandled aggregate operation");
+                }
+            } else if (const auto* uda = as<ram::UserDefinedAggregator>(aggregator)) {
+                std::stringstream def;
+                std::string name = uda->getName();
+                def << "#pragma omp declare reduction("
+                    << "reduction_" << name << " : " << getType(aggregator) << " : \\\n";
+                // TODO: does not work for stateful functors
+                def << "omp_out = " << name << "(omp_out, omp_in) )\\\n";
+                def << "initializer (omp_priv=(omp_orig))\n";
+                return std::make_tuple("reduction_" + name, def.str(), 0);
+            }
+            fatal("Unhandled aggregator");
+        }
+
+        void ifIntrinsic(const ram::Aggregator& aggregator, AggregateOp op, std::function<void()> fn) {
+            if (const auto* ia = as<ram::IntrinsicAggregator>(aggregator)) {
+                if (ia->getFunction() == op) {
+                    fn();
+                };
+            }
+        }
+
         void visit_(type_identity<ParallelIndexAggregate>, const ParallelIndexAggregate& aggregate,
                 std::ostream& out) override {
             assert(aggregate.getTupleId() == 0 && "not outer-most loop");
@@ -1095,9 +1269,13 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
             // get range to aggregate
             auto keys = isa->getSearchSignature(&aggregate);
 
+            const ram::Aggregator& aggregator = aggregate.getAggregator();
+
+            bool isCount = false;
+            ifIntrinsic(aggregator, AggregateOp::COUNT, [&]() { isCount = true; });
+
             // special case: counting number elements over an unrestricted predicate
-            if (aggregate.getFunction() == AggregateOp::COUNT && keys.empty() &&
-                    isTrue(&aggregate.getCondition())) {
+            if (isCount && keys.empty() && isTrue(&aggregate.getCondition())) {
                 // shortcut: use relation size
                 out << "env" << identifier << "[0] = " << relName << "->"
                     << "size();\n";
@@ -1108,79 +1286,26 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
                 return;
             }
 
-            out << "bool shouldRunNested = false;\n";
-
             // init result and reduction operation
-            std::string init;
-            switch (aggregate.getFunction()) {
-                case AggregateOp::MIN: init = "MAX_RAM_SIGNED"; break;
-                case AggregateOp::FMIN: init = "MAX_RAM_FLOAT"; break;
-                case AggregateOp::UMIN: init = "MAX_RAM_UNSIGNED"; break;
-                case AggregateOp::MAX: init = "MIN_RAM_SIGNED"; break;
-                case AggregateOp::FMAX: init = "MIN_RAM_FLOAT"; break;
-                case AggregateOp::UMAX: init = "MIN_RAM_UNSIGNED"; break;
-                case AggregateOp::COUNT:
-                    init = "0";
-                    out << "shouldRunNested = true;\n";
-                    break;
-                case AggregateOp::MEAN: init = "0"; break;
-                case AggregateOp::FSUM:
-                case AggregateOp::USUM:
-                case AggregateOp::SUM:
-                    init = "0";
-                    out << "shouldRunNested = true;\n";
-                    break;
-            }
+            std::string init = initValue(aggregator);
+            out << "bool shouldRunNested = " << (shouldRunNested(aggregator) ? "true" : "false") << ";\n";
 
             // Set reduction operation
             std::string op;
-            std::string omp_min_ver;
-            switch (aggregate.getFunction()) {
-                case AggregateOp::MIN:
-                case AggregateOp::FMIN:
-                case AggregateOp::UMIN: {
-                    op = "min";
-                    omp_min_ver = "200805";  // from OMP 3.0
-                    break;
-                }
+            std::string op_def;
+            int omp_min_ver;
+            std::tie(op, op_def, omp_min_ver) = reductionOperation(aggregator);
 
-                case AggregateOp::MAX:
-                case AggregateOp::FMAX:
-                case AggregateOp::UMAX: {
-                    op = "max";
-                    omp_min_ver = "200805";  // from OMP 3.0
-                    break;
-                }
-
-                case AggregateOp::MEAN:
-                case AggregateOp::FSUM:
-                case AggregateOp::USUM:
-                case AggregateOp::COUNT:
-                case AggregateOp::SUM: {
-                    omp_min_ver = "0";
-                    op = "+";
-                    break;
-                }
-                default: fatal("Unhandled aggregate operation");
-            }
             // res0 stores the aggregate result
             std::string sharedVariable = "res0";
 
-            std::string type;
-            switch (getTypeAttributeAggregate(aggregate.getFunction())) {
-                case TypeAttribute::Signed: type = "RamSigned"; break;
-                case TypeAttribute::Unsigned: type = "RamUnsigned"; break;
-                case TypeAttribute::Float: type = "RamFloat"; break;
+            std::string type = getType(aggregator);
 
-                case TypeAttribute::Symbol:
-                case TypeAttribute::ADT:
-                case TypeAttribute::Record: type = "RamDomain"; break;
-            }
             out << type << " res0 = " << init << ";\n";
-            if (aggregate.getFunction() == AggregateOp::MEAN) {
+            ifIntrinsic(aggregator, AggregateOp::MEAN, [&]() {
                 out << "RamUnsigned res1 = 0;\n";
                 sharedVariable += ", res1";
-            }
+            });
 
             out << preamble.str();
             out << "PARALLEL_START\n";
@@ -1188,6 +1313,7 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
             if (keys.empty()) {
                 // OMP reduction is not available on all versions of OpenMP
                 out << "#if defined _OPENMP && _OPENMP >= " << omp_min_ver << "\n";
+                out << op_def << "\n";
                 out << "#pragma omp for reduction(" << op << ":" << sharedVariable << ")\n";
                 out << "#endif\n";
 
@@ -1214,6 +1340,7 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
 
                 // OMP reduction is not available on all versions of OpenMP
                 out << "#if defined _OPENMP && _OPENMP >= " << omp_min_ver << "\n";
+                out << op_def << "\n";
                 out << "#pragma omp for reduction(" << op << ":" << sharedVariable << ")\n";
                 out << "#endif\n";
 
@@ -1238,39 +1365,7 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
             out << "shouldRunNested = true;\n";
 
             // pick function
-            switch (aggregate.getFunction()) {
-                case AggregateOp::FMIN:
-                case AggregateOp::UMIN:
-                case AggregateOp::MIN:
-                    out << "res0 = std::min(res0,ramBitCast<" << type << ">(";
-                    dispatch(aggregate.getExpression(), out);
-                    out << "));\n";
-                    break;
-                case AggregateOp::FMAX:
-                case AggregateOp::UMAX:
-                case AggregateOp::MAX:
-                    out << "res0 = std::max(res0,ramBitCast<" << type << ">(";
-                    dispatch(aggregate.getExpression(), out);
-                    out << "));\n";
-                    break;
-                case AggregateOp::COUNT: out << "++res0\n;"; break;
-                case AggregateOp::FSUM:
-                case AggregateOp::USUM:
-                case AggregateOp::SUM:
-                    out << "res0 += "
-                        << "ramBitCast<" << type << ">(";
-                    dispatch(aggregate.getExpression(), out);
-                    out << ");\n";
-                    break;
-
-                case AggregateOp::MEAN:
-                    out << "res0 += "
-                        << "ramBitCast<RamFloat>(";
-                    dispatch(aggregate.getExpression(), out);
-                    out << ");\n";
-                    out << "++res1;\n";
-                    break;
-            }
+            updateRes(out, aggregate);
 
             // end if statement
             out << "}\n";
@@ -1286,11 +1381,11 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
             // start single-threaded section
             out << "#pragma omp single\n{\n";
 
-            if (aggregate.getFunction() == AggregateOp::MEAN) {
+            ifIntrinsic(aggregator, AggregateOp::MEAN, [&]() {
                 out << "if (res1 != 0) {\n";
                 out << "res0 = res0 / res1;\n";
                 out << "}\n";
-            }
+            });
 
             // write result into environment tuple
             out << "env" << identifier << "[0] = ramBitCast(res0);\n";
@@ -1334,9 +1429,13 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
             // get range to aggregate
             auto keys = isa->getSearchSignature(&aggregate);
 
+            const ram::Aggregator& aggregator = aggregate.getAggregator();
+
+            bool isCount = false;
+            ifIntrinsic(aggregator, AggregateOp::COUNT, [&]() { isCount = true; });
+
             // special case: counting number elements over an unrestricted predicate
-            if (aggregate.getFunction() == AggregateOp::COUNT && keys.empty() &&
-                    isTrue(&aggregate.getCondition())) {
+            if (isCount && keys.empty() && isTrue(&aggregate.getCondition())) {
                 // shortcut: use relation size
                 out << "env" << identifier << "[0] = " << relName << "->"
                     << "size();\n";
@@ -1345,45 +1444,15 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
                 return;
             }
 
-            out << "bool shouldRunNested = false;\n";
-
             // init result
-            std::string init;
-            switch (aggregate.getFunction()) {
-                case AggregateOp::MIN: init = "MAX_RAM_SIGNED"; break;
-                case AggregateOp::FMIN: init = "MAX_RAM_FLOAT"; break;
-                case AggregateOp::UMIN: init = "MAX_RAM_UNSIGNED"; break;
-                case AggregateOp::MAX: init = "MIN_RAM_SIGNED"; break;
-                case AggregateOp::FMAX: init = "MIN_RAM_FLOAT"; break;
-                case AggregateOp::UMAX: init = "MIN_RAM_UNSIGNED"; break;
-                case AggregateOp::COUNT:
-                    init = "0";
-                    out << "shouldRunNested = true;\n";
-                    break;
-                case AggregateOp::MEAN: init = "0"; break;
-                case AggregateOp::FSUM:
-                case AggregateOp::USUM:
-                case AggregateOp::SUM:
-                    init = "0";
-                    out << "shouldRunNested = true;\n";
-                    break;
-            }
+            std::string init = initValue(aggregator);
+            out << "bool shouldRunNested = " << (shouldRunNested(aggregator) ? "true" : "false") << ";\n";
 
-            std::string type;
-            switch (getTypeAttributeAggregate(aggregate.getFunction())) {
-                case TypeAttribute::Signed: type = "RamSigned"; break;
-                case TypeAttribute::Unsigned: type = "RamUnsigned"; break;
-                case TypeAttribute::Float: type = "RamFloat"; break;
+            std::string type = getType(aggregator);
 
-                case TypeAttribute::Symbol:
-                case TypeAttribute::ADT:
-                case TypeAttribute::Record: type = "RamDomain"; break;
-            }
             out << type << " res0 = " << init << ";\n";
 
-            if (aggregate.getFunction() == AggregateOp::MEAN) {
-                out << "RamUnsigned res1 = 0;\n";
-            }
+            ifIntrinsic(aggregator, AggregateOp::MEAN, [&]() { out << "RamUnsigned res1 = 0;\n"; });
 
             // check whether there is an index to use
             if (keys.empty()) {
@@ -1411,53 +1480,26 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
             out << "shouldRunNested = true;\n";
 
             // pick function
-            switch (aggregate.getFunction()) {
-                case AggregateOp::FMIN:
-                case AggregateOp::UMIN:
-                case AggregateOp::MIN:
-                    out << "res0 = std::min(res0,ramBitCast<" << type << ">(";
-                    dispatch(aggregate.getExpression(), out);
-                    out << "));\n";
-                    if (isGuaranteedToBeMinimum(aggregate)) {
-                        out << "break;\n";
-                    }
-                    break;
-                case AggregateOp::FMAX:
-                case AggregateOp::UMAX:
-                case AggregateOp::MAX:
-                    out << "res0 = std::max(res0,ramBitCast<" << type << ">(";
-                    dispatch(aggregate.getExpression(), out);
-                    out << "));\n";
-                    break;
-                case AggregateOp::COUNT: out << "++res0\n;"; break;
-                case AggregateOp::FSUM:
-                case AggregateOp::USUM:
-                case AggregateOp::SUM:
-                    out << "res0 += "
-                        << "ramBitCast<" << type << ">(";
-                    dispatch(aggregate.getExpression(), out);
-                    out << ");\n";
-                    break;
-
-                case AggregateOp::MEAN:
-                    out << "res0 += "
-                        << "ramBitCast<RamFloat>(";
-                    dispatch(aggregate.getExpression(), out);
-                    out << ");\n";
-                    out << "++res1;\n";
-                    break;
-            }
+            updateRes(out, aggregate);
+            auto printBreak = [&]() {
+                if (isGuaranteedToBeMinimum(aggregate)) {
+                    out << "break;\n";
+                }
+            };
+            ifIntrinsic(aggregator, AggregateOp::FMIN, printBreak);
+            ifIntrinsic(aggregator, AggregateOp::UMIN, printBreak);
+            ifIntrinsic(aggregator, AggregateOp::MIN, printBreak);
 
             out << "}\n";
 
             // end aggregator loop
             out << "}\n";
 
-            if (aggregate.getFunction() == AggregateOp::MEAN) {
+            ifIntrinsic(aggregator, AggregateOp::MEAN, [&]() {
                 out << "if (res1 != 0) {\n";
                 out << "res0 = res0 / res1;\n";
                 out << "}\n";
-            }
+            });
 
             // write result into environment tuple
             out << "env" << identifier << "[0] = ramBitCast(res0);\n";
@@ -1486,8 +1528,13 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
             // declare environment variable
             out << "Tuple<RamDomain,1> env" << identifier << ";\n";
 
+            const ram::Aggregator& aggregator = aggregate.getAggregator();
+
+            bool isCount = false;
+            ifIntrinsic(aggregator, AggregateOp::COUNT, [&]() { isCount = true; });
+
             // special case: counting number elements over an unrestricted predicate
-            if (aggregate.getFunction() == AggregateOp::COUNT && isTrue(&aggregate.getCondition())) {
+            if (isCount && isTrue(&aggregate.getCondition())) {
                 // shortcut: use relation size
                 out << "env" << identifier << "[0] = " << relName << "->"
                     << "size();\n";
@@ -1498,83 +1545,25 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
                 return;
             }
 
-            out << "bool shouldRunNested = false;\n";
-
             // init result
-            std::string init;
-            switch (aggregate.getFunction()) {
-                case AggregateOp::MIN: init = "MAX_RAM_SIGNED"; break;
-                case AggregateOp::FMIN: init = "MAX_RAM_FLOAT"; break;
-                case AggregateOp::UMIN: init = "MAX_RAM_UNSIGNED"; break;
-                case AggregateOp::MAX: init = "MIN_RAM_SIGNED"; break;
-                case AggregateOp::FMAX: init = "MIN_RAM_FLOAT"; break;
-                case AggregateOp::UMAX: init = "MIN_RAM_UNSIGNED"; break;
-                case AggregateOp::COUNT:
-                    init = "0";
-                    out << "shouldRunNested = true;\n";
-                    break;
-
-                case AggregateOp::MEAN: init = "0"; break;
-
-                case AggregateOp::FSUM:
-                case AggregateOp::USUM:
-                case AggregateOp::SUM:
-                    init = "0";
-                    out << "shouldRunNested = true;\n";
-                    break;
-            }
+            std::string init = initValue(aggregator);
+            out << "bool shouldRunNested = " << (shouldRunNested(aggregator) ? "true" : "false") << ";\n";
 
             // Set reduction operation
             std::string op;
-            std::string omp_min_ver;
-            switch (aggregate.getFunction()) {
-                case AggregateOp::MIN:
-                case AggregateOp::FMIN:
-                case AggregateOp::UMIN: {
-                    op = "min";
-                    omp_min_ver = "200805";  // from OMP 3.0
-                    break;
-                }
+            std::string op_def;
+            int omp_min_ver;
+            std::tie(op, op_def, omp_min_ver) = reductionOperation(aggregator);
 
-                case AggregateOp::MAX:
-                case AggregateOp::FMAX:
-                case AggregateOp::UMAX: {
-                    op = "max";
-                    omp_min_ver = "200805";  // from OMP 3.0
-                    break;
-                }
+            std::string type = getType(aggregator);
 
-                case AggregateOp::MEAN:
-                case AggregateOp::FSUM:
-                case AggregateOp::USUM:
-                case AggregateOp::COUNT:
-                case AggregateOp::SUM: {
-                    op = "+";
-                    omp_min_ver = "0";
-                    break;
-                }
-
-                default: fatal("Unhandled aggregate operation");
-            }
-
-            char const* type = NULL;
-            switch (getTypeAttributeAggregate(aggregate.getFunction())) {
-                case TypeAttribute::Signed: type = "RamSigned"; break;
-                case TypeAttribute::Unsigned: type = "RamUnsigned"; break;
-                case TypeAttribute::Float: type = "RamFloat"; break;
-
-                case TypeAttribute::Symbol:
-                case TypeAttribute::ADT:
-                case TypeAttribute::Record: type = "RamDomain"; break;
-                default: assert(0);
-            }
             out << type << " res0 = " << init << ";\n";
 
             std::string sharedVariable = "res0";
-            if (aggregate.getFunction() == AggregateOp::MEAN) {
+            ifIntrinsic(aggregator, AggregateOp::MEAN, [&]() {
                 out << "RamUnsigned res1 = " << init << ";\n";
                 sharedVariable += ", res1";
-            }
+            });
 
             // create a partitioning of the relation to iterate over simeltaneously
             out << "auto part = " << relName << "->partition();\n";
@@ -1591,6 +1580,7 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
 
             // pragma statement
             out << "#if defined _OPENMP && _OPENMP >= " << omp_min_ver << "\n";
+            out << op_def << "\n";
             out << "#pragma omp for reduction(" << op << ":" << sharedVariable << ")\n";
             out << "#endif\n";
 
@@ -1613,37 +1603,7 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
 
             out << "shouldRunNested = true;\n";
             // pick function
-            switch (aggregate.getFunction()) {
-                case AggregateOp::FMIN:
-                case AggregateOp::UMIN:
-                case AggregateOp::MIN:
-                    out << "res0 = std::min(res0, ramBitCast<" << type << ">(";
-                    dispatch(aggregate.getExpression(), out);
-                    out << "));\n";
-                    break;
-                case AggregateOp::FMAX:
-                case AggregateOp::UMAX:
-                case AggregateOp::MAX:
-                    out << "res0 = std::max(res0, ramBitCast<" << type << ">(";
-                    dispatch(aggregate.getExpression(), out);
-                    out << "));\n";
-                    break;
-                case AggregateOp::COUNT: out << "++res0\n;"; break;
-                case AggregateOp::FSUM:
-                case AggregateOp::USUM:
-                case AggregateOp::SUM:
-                    out << "res0 += ramBitCast<" << type << ">(";
-                    dispatch(aggregate.getExpression(), out);
-                    out << ");\n";
-                    break;
-
-                case AggregateOp::MEAN:
-                    out << "res0 += ramBitCast<RamFloat>(";
-                    dispatch(aggregate.getExpression(), out);
-                    out << ");\n";
-                    out << "++res1;\n";
-                    break;
-            }
+            updateRes(out, aggregate);
 
             out << "}\n";
 
@@ -1655,11 +1615,11 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
             // the rest shouldn't be run in parallel
             out << "#pragma omp single\n{\n";
 
-            if (aggregate.getFunction() == AggregateOp::MEAN) {
+            ifIntrinsic(aggregator, AggregateOp::MEAN, [&]() {
                 out << "if (res1 != 0) {\n";
                 out << "res0 = res0 / res1;\n";
                 out << "}\n";
-            }
+            });
 
             // write result into environment tuple
             out << "env" << identifier << "[0] = ramBitCast(res0);\n";
@@ -1682,8 +1642,13 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
             // declare environment variable
             out << "Tuple<RamDomain,1> env" << identifier << ";\n";
 
+            const ram::Aggregator& aggregator = aggregate.getAggregator();
+
+            bool isCount = false;
+            ifIntrinsic(aggregator, AggregateOp::COUNT, [&]() { isCount = true; });
+
             // special case: counting number elements over an unrestricted predicate
-            if (aggregate.getFunction() == AggregateOp::COUNT && isTrue(&aggregate.getCondition())) {
+            if (isCount && isTrue(&aggregate.getCondition())) {
                 // shortcut: use relation size
                 out << "env" << identifier << "[0] = " << relName << "->"
                     << "size();\n";
@@ -1692,48 +1657,15 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
                 return;
             }
 
-            out << "bool shouldRunNested = false;\n";
-
             // init result
-            std::string init;
-            switch (aggregate.getFunction()) {
-                case AggregateOp::MIN: init = "MAX_RAM_SIGNED"; break;
-                case AggregateOp::FMIN: init = "MAX_RAM_FLOAT"; break;
-                case AggregateOp::UMIN: init = "MAX_RAM_UNSIGNED"; break;
-                case AggregateOp::MAX: init = "MIN_RAM_SIGNED"; break;
-                case AggregateOp::FMAX: init = "MIN_RAM_FLOAT"; break;
-                case AggregateOp::UMAX: init = "MIN_RAM_UNSIGNED"; break;
-                case AggregateOp::COUNT:
-                    init = "0";
-                    out << "shouldRunNested = true;\n";
-                    break;
+            std::string init = initValue(aggregator);
+            out << "bool shouldRunNested = " << (shouldRunNested(aggregator) ? "true" : "false") << ";\n";
 
-                case AggregateOp::MEAN: init = "0"; break;
+            std::string type = getType(aggregator);
 
-                case AggregateOp::FSUM:
-                case AggregateOp::USUM:
-                case AggregateOp::SUM:
-                    init = "0";
-                    out << "shouldRunNested = true;\n";
-                    break;
-            }
-
-            std::string type;
-            switch (getTypeAttributeAggregate(aggregate.getFunction())) {
-                case TypeAttribute::Signed: type = "RamSigned"; break;
-                case TypeAttribute::Unsigned: type = "RamUnsigned"; break;
-                case TypeAttribute::Float: type = "RamFloat"; break;
-
-                case TypeAttribute::Symbol:
-                case TypeAttribute::ADT:
-                case TypeAttribute::Record:
-                default: type = "RamDomain"; break;
-            }
             out << type << " res0 = " << init << ";\n";
 
-            if (aggregate.getFunction() == AggregateOp::MEAN) {
-                out << "RamUnsigned res1 = 0;\n";
-            }
+            ifIntrinsic(aggregator, AggregateOp::MEAN, [&]() { out << "RamUnsigned res1 = 0;\n"; });
 
             // check whether there is an index to use
             out << "for(const auto& env" << identifier << " : "
@@ -1746,49 +1678,14 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
 
             out << "shouldRunNested = true;\n";
             // pick function
-            switch (aggregate.getFunction()) {
-                case AggregateOp::FMIN:
-                case AggregateOp::UMIN:
-                case AggregateOp::MIN:
-                    out << "res0 = std::min(res0, ramBitCast<" << type << ">(";
-                    dispatch(aggregate.getExpression(), out);
-                    out << "));\n";
-                    break;
-                case AggregateOp::FMAX:
-                case AggregateOp::UMAX:
-                case AggregateOp::MAX:
-                    out << "res0 = std::max(res0,ramBitCast<" << type << ">(";
-                    dispatch(aggregate.getExpression(), out);
-                    out << "));\n";
-                    break;
-                case AggregateOp::COUNT: out << "++res0\n;"; break;
-                case AggregateOp::FSUM:
-                case AggregateOp::USUM:
-                case AggregateOp::SUM:
-                    out << "res0 += "
-                        << "ramBitCast<" << type << ">(";
-                    ;
-                    dispatch(aggregate.getExpression(), out);
-                    out << ");\n";
-                    break;
-
-                case AggregateOp::MEAN:
-                    out << "res0 += "
-                        << "ramBitCast<RamFloat>(";
-                    dispatch(aggregate.getExpression(), out);
-                    out << ");\n";
-                    out << "++res1;\n";
-                    break;
-            }
+            updateRes(out, aggregate);
 
             out << "}\n";
 
             // end aggregator loop
             out << "}\n";
 
-            if (aggregate.getFunction() == AggregateOp::MEAN) {
-                out << "res0 = res0 / res1;\n";
-            }
+            ifIntrinsic(aggregator, AggregateOp::MEAN, [&]() { out << "res0 = res0 / res1;\n"; });
 
             // write result into environment tuple
             out << "env" << identifier << "[0] = ramBitCast(res0);\n";
@@ -1952,21 +1849,43 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
 
                 // strings
                 case BinaryConstraintOp::MATCH: {
-                    synthesiser.SubroutineUsingStdRegex = true;
-                    out << "regex_wrapper(symTable.decode(";
-                    dispatch(rel.getLHS(), out);
-                    out << "),symTable.decode(";
-                    dispatch(rel.getRHS(), out);
-                    out << "))";
+                    if (const StringConstant* str = dynamic_cast<const StringConstant*>(&rel.getLHS()); str) {
+                        const auto& regex = synthesiser.compileRegex(str->getConstant());
+                        if (regex) {
+                            out << "std::regex_match(symTable.decode(";
+                            dispatch(rel.getRHS(), out);
+                            out << "), regexes.at(" << *regex << "))";
+                        } else {
+                            out << "false";
+                        }
+                    } else {
+                        synthesiser.SubroutineUsingStdRegex = true;
+                        out << "regex_wrapper(symTable.decode(";
+                        dispatch(rel.getLHS(), out);
+                        out << "),symTable.decode(";
+                        dispatch(rel.getRHS(), out);
+                        out << "))";
+                    }
                     break;
                 }
                 case BinaryConstraintOp::NOT_MATCH: {
-                    synthesiser.SubroutineUsingStdRegex = true;
-                    out << "!regex_wrapper(symTable.decode(";
-                    dispatch(rel.getLHS(), out);
-                    out << "),symTable.decode(";
-                    dispatch(rel.getRHS(), out);
-                    out << "))";
+                    if (const StringConstant* str = dynamic_cast<const StringConstant*>(&rel.getLHS()); str) {
+                        const auto& regex = synthesiser.compileRegex(str->getConstant());
+                        if (regex) {
+                            out << "!std::regex_match(symTable.decode(";
+                            dispatch(rel.getRHS(), out);
+                            out << "), regexes.at(" << *regex << "))";
+                        } else {
+                            out << "false";
+                        }
+                    } else {
+                        synthesiser.SubroutineUsingStdRegex = true;
+                        out << "!regex_wrapper(symTable.decode(";
+                        dispatch(rel.getLHS(), out);
+                        out << "),symTable.decode(";
+                        dispatch(rel.getRHS(), out);
+                        out << "))";
+                    }
                     break;
                 }
                 case BinaryConstraintOp::CONTAINS: {
@@ -2021,7 +1940,7 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
             auto arity = rel->getArity();
             assert(arity > 0 && "AstToRamTranslator failed");
             std::string after;
-            if (Global::config().has("profile") && Global::config().has("profile-frequency") &&
+            if (glb.config().has("profile") && glb.config().has("profile-frequency") &&
                     !synthesiser.lookup(exists.getRelation())->isTemp()) {
                 out << R"_((reads[)_" << synthesiser.lookupReadIdx(rel->getName()) << R"_(]++,)_";
                 after = ")";
@@ -2546,6 +2465,14 @@ std::set<std::string> Synthesiser::accessedUserDefinedFunctors(Statement& stmt) 
         const std::string& name = node.getName();
         accessed.insert(name);
     });
+    auto visitAggregate = [&](const AbstractAggregate& op) {
+        const Aggregator& aggregator = op.getAggregator();
+        if (const auto* uda = as<UserDefinedAggregator>(aggregator)) {
+            accessed.insert(uda->getName());
+        }
+    };
+    visit(stmt, [&](const Aggregate& op) { visitAggregate(op); });
+    visit(stmt, [&](const IndexAggregate& op) { visitAggregate(op); });
     return accessed;
 };
 
@@ -2564,25 +2491,35 @@ void Synthesiser::generateCode(GenDb& db, const std::string& id, bool& withShare
     std::string classname = "Sf_" + id;
 
     // generate C++ program
+    std::string package_gen_version = "SOUFFLE_GENERATOR_VERSION \"";
+    package_gen_version += PACKAGE_VERSION;
+    package_gen_version += "\"";
+    db.addGlobalDefine(package_gen_version);
 
-    if (Global::config().has("verbose")) {
+    if (glb.config().has("verbose")) {
         db.addGlobalDefine("_SOUFFLE_STATS");
         db.addGlobalInclude("\"souffle/profile/ProfileEvent.h\"");
     }
 
-    if (Global::config().has("provenance")) {
+    if (glb.config().has("provenance")) {
         db.addGlobalInclude("<mutex>");
         db.addGlobalInclude("\"souffle/provenance/Explain.h\"");
     }
 
-    if (Global::config().has("live-profile")) {
+    if (glb.config().has("live-profile")) {
         db.addGlobalInclude("<thread>");
         db.addGlobalInclude("\"souffle/profile/Tui.h\"");
     }
 
-    if (Global::config().has("profile") || Global::config().has("live-profile")) {
+    if (glb.config().has("profile") || glb.config().has("live-profile")) {
         db.addGlobalInclude("\"souffle/profile/Logger.h\"");
         db.addGlobalInclude("\"souffle/profile/ProfileEvent.h\"");
+    }
+
+    if (glb.config().has("generate-namespace")) {
+        db.setNS(glb.config().get("generate-namespace"));
+    } else {
+        db.setNS("souffle");
     }
 
     // produce external definitions for user-defined functors
@@ -2593,6 +2530,17 @@ void Synthesiser::generateCode(GenDb& db, const std::string& id, bool& withShare
         }
         withSharedLibrary = true;
     });
+    auto visitAggregate = [&](const AbstractAggregate& op) {
+        const Aggregator& aggregator = op.getAggregator();
+        if (const auto* uda = as<UserDefinedAggregator>(aggregator)) {
+            functors[uda->getName()] =
+                    std::make_tuple(uda->getReturnType(), uda->getArgsTypes(), uda->isStateful());
+            withSharedLibrary = true;
+        }
+    };
+    visit(prog, [&](const Aggregate& op) { visitAggregate(op); });
+    visit(prog, [&](const IndexAggregate& op) { visitAggregate(op); });
+
     for (const auto& f : functors) {
         const std::string& name = f.first;
 
@@ -2672,11 +2620,28 @@ void Synthesiser::generateCode(GenDb& db, const std::string& id, bool& withShare
         db.usesDatastructure(mainClass, typeName);
     }
 
+    std::set<std::string> loadRelations;
+    std::set<const IO*> loadIOs;
+    std::set<const IO*> storeIOs;
+
+    // collect load/store operations/relations
+    visit(prog, [&](const IO& io) {
+        auto op = io.get("operation");
+        if (op == "input") {
+            loadRelations.insert(io.getRelation());
+            loadIOs.insert(&io);
+        } else if (op == "printsize" || op == "output") {
+            storeRelations.insert(io.getRelation());
+            storeIOs.insert(&io);
+        } else {
+            assert("wrong I/O operation");
+        }
+    });
+
     // identify relations used by each subroutines
     std::multimap<std::string /* stratum_* */, std::string> subroutineUses;
 
     // generate class for each subroutine
-    std::size_t subroutineNum = 0;
     std::vector<std::pair<std::string, std::string>> subroutineInits;
     for (auto& sub : prog.getSubroutines()) {
         GenClass& gen = db.getClass(convertStratumIdent("Stratum_" + sub.first),
@@ -2688,7 +2653,6 @@ void Synthesiser::generateCode(GenDb& db, const std::string& id, bool& withShare
 
         gen.addInclude("\"souffle/SouffleInterface.h\"");
         gen.addInclude("\"souffle/SignalHandler.h\"");
-        gen.addInclude("\"souffle/io/IOSystem.h\"", true);
 
         GenFunction& constructor = gen.addConstructor(Visibility::Public);
 
@@ -2696,6 +2660,7 @@ void Synthesiser::generateCode(GenDb& db, const std::string& id, bool& withShare
         std::vector<std::tuple<Mode, std::string /*name*/, std::string /*type*/>> args;
         args.push_back(std::make_tuple(Reference, "symTable", "SymbolTable"));
         args.push_back(std::make_tuple(Reference, "recordTable", "RecordTable"));
+        args.push_back(std::make_tuple(Reference, "regexCache", "ConcurrentCache<std::string,std::regex>"));
         args.push_back(std::make_tuple(Reference, "pruneImdtRels", "bool"));
         args.push_back(std::make_tuple(Reference, "performIO", "bool"));
         args.push_back(std::make_tuple(Reference, "signalHandler", "SignalHandler*"));
@@ -2754,17 +2719,39 @@ void Synthesiser::generateCode(GenDb& db, const std::string& id, bool& withShare
         if (SubroutineUsingStdRegex) {
             // regex wrapper
             GenFunction& wrapper = gen.addFunction("regex_wrapper", Visibility::Private);
-            gen.addInclude("<regex>");
             wrapper.setRetType("inline bool");
             wrapper.setNextArg("const std::string&", "pattern");
             wrapper.setNextArg("const std::string&", "text");
             wrapper.body()
                     << "   bool result = false; \n"
-                    << "   try { result = std::regex_match(text, std::regex(pattern)); } catch(...) { \n"
+                    << "   try { result = std::regex_match(text, regexCache.getOrCreate(pattern)); } "
+                       "catch(...) { "
+                       "\n"
                     << "     std::cerr << \"warning: wrong pattern provided for match(\\\"\" << pattern << "
                        "\"\\\",\\\"\" "
                        "<< text << \"\\\").\\n\";\n}\n"
                     << "   return result;\n";
+        }
+
+        if (!regexes.empty()) {
+            gen.addField("std::vector<std::regex>", "regexes", Visibility::Private);
+            std::stringstream rst;
+            // we need to collect the patterns first and place each
+            // one into the correct slot
+            std::vector<std::string> patterns;
+            patterns.resize(regexes.size());
+            for (const auto& pi : regexes) {
+                patterns.at(pi.second) = pi.first;
+            }
+            rst << "{\n";
+            for (const auto& p : patterns) {
+                const std::string escaped = escape(p);
+                rst << "\tstd::regex(\"" << escaped << "\"),\n";
+            }
+            rst << "}";
+
+            constructor.setNextInitializer("regexes", rst.str());
+            regexes.clear();
         }
 
         // substring wrapper
@@ -2781,13 +2768,12 @@ void Synthesiser::generateCode(GenDb& db, const std::string& id, bool& withShare
                               "\") functor.\\n\";\n"
                            << "} return result;\n";
         }
-        subroutineNum++;
     }
 
     GenFunction& constructor = mainClass.addConstructor(Visibility::Public);
     constructor.setIsConstructor();
 
-    if (Global::config().has("profile")) {
+    if (glb.config().has("profile")) {
         mainClass.addField("std::string", "profiling_fname", Visibility::Public);
         constructor.setNextArg("std::string", "pf", std::make_optional("\"profile.log\""));
         constructor.setNextInitializer("profiling_fname", "std::move(pf)");
@@ -2818,7 +2804,10 @@ void Synthesiser::generateCode(GenDb& db, const std::string& id, bool& withShare
     mainClass.addField(rt.str(), "recordTable", Visibility::Private);
     constructor.setNextInitializer("recordTable", "");
 
-    if (Global::config().has("profile")) {
+    mainClass.addField("ConcurrentCache<std::string,std::regex>", "regexCache", Visibility::Private);
+    constructor.setNextInitializer("regexCache", "");
+
+    if (glb.config().has("profile")) {
         std::size_t numFreq = 0;
         visit(prog, [&](const Statement&) { numFreq++; });
         mainClass.addField("std::size_t", "freqs[" + std::to_string(numFreq) + "]", Visibility::Private);
@@ -2837,25 +2826,6 @@ void Synthesiser::generateCode(GenDb& db, const std::string& id, bool& withShare
         const std::string& name = f.first;
         mainClass.addField(function_ty(name), name, Visibility::Private);
     }
-
-    std::set<std::string> storeRelations;
-    std::set<std::string> loadRelations;
-    std::set<const IO*> loadIOs;
-    std::set<const IO*> storeIOs;
-
-    // collect load/store operations/relations
-    visit(prog, [&](const IO& io) {
-        auto op = io.get("operation");
-        if (op == "input") {
-            loadRelations.insert(io.getRelation());
-            loadIOs.insert(&io);
-        } else if (op == "printsize" || op == "output") {
-            storeRelations.insert(io.getRelation());
-            storeIOs.insert(&io);
-        } else {
-            assert("wrong I/O operation");
-        }
-    });
 
     int relCtr = 0;
     for (auto rel : prog.getRelations()) {
@@ -2894,16 +2864,15 @@ void Synthesiser::generateCode(GenDb& db, const std::string& id, bool& withShare
             constructor.setNextInitializer(wrapper_name.str(), init.str());
         }
     }
-    std::size_t i = 0;
+
     for (auto [name, value] : subroutineInits) {
         std::string clName = convertStratumIdent("Stratum_" + name);
         std::string fName = convertStratumIdent("stratum_" + name);
         mainClass.addField(clName, fName, Visibility::Private);
         constructor.setNextInitializer(fName, value);
-        i++;
     }
 
-    if (Global::config().has("profile")) {
+    if (glb.config().has("profile")) {
         constructor.body() << "ProfileEventSingleton::instance().setOutputFile(profiling_fname);\n";
     }
 
@@ -2948,13 +2917,13 @@ void Synthesiser::generateCode(GenDb& db, const std::string& id, bool& withShare
 
     signalHandler->set();
 )_";
-    if (Global::config().has("verbose")) {
+    if (glb.config().has("verbose")) {
         runFunction.body() << "signalHandler->enableLogging();\n";
     }
 
     // add actual program body
     runFunction.body() << "// -- query evaluation --\n";
-    if (Global::config().has("profile")) {
+    if (glb.config().has("profile")) {
         runFunction.body() << "ProfileEventSingleton::instance().startTimer();\n"
                            << R"_(ProfileEventSingleton::instance().makeTimeEvent("@time;starttime");)_"
                            << '\n'
@@ -2977,7 +2946,7 @@ void Synthesiser::generateCode(GenDb& db, const std::string& id, bool& withShare
     currentClass = &mainClass;
     emitCode(runFunction.body(), prog.getMain());
 
-    if (Global::config().has("profile")) {
+    if (glb.config().has("profile")) {
         runFunction.body() << "}\n"
                            << "ProfileEventSingleton::instance().stopTimer();\n"
                            << "dumpFreqs();\n";
@@ -2986,7 +2955,7 @@ void Synthesiser::generateCode(GenDb& db, const std::string& id, bool& withShare
     // add code printing hint statistics
     runFunction.body() << "\n// -- relation hint statistics --\n";
 
-    if (Global::config().has("verbose")) {
+    if (glb.config().has("verbose")) {
         for (auto rel : prog.getRelations()) {
             auto name = getRelationName(*rel);
             runFunction.body() << "std::cout << \"Statistics for Relation " << name << ":\\n\";\n"
@@ -3010,11 +2979,11 @@ void Synthesiser::generateCode(GenDb& db, const std::string& id, bool& withShare
     runAll.setNextArg("std::string", "outputDirectoryArg", std::make_optional("\"\""));
     runAll.setNextArg("bool", "performIOArg", std::make_optional("true"));
     runAll.setNextArg("bool", "pruneImdtRelsArg", std::make_optional("true"));
-    if (Global::config().has("live-profile")) {
+    if (glb.config().has("live-profile")) {
         runAll.body() << "std::thread profiler([]() { profile::Tui().runProf(); });\n";
     }
     runAll.body() << "runFunction(inputDirectoryArg, outputDirectoryArg, performIOArg, pruneImdtRelsArg);\n";
-    if (Global::config().has("live-profile")) {
+    if (glb.config().has("live-profile")) {
         runAll.body() << "if (profiler.joinable()) { profiler.join(); }\n";
     }
 
@@ -3074,7 +3043,7 @@ void Synthesiser::generateCode(GenDb& db, const std::string& id, bool& withShare
         loadAll.body() << ");\n";
         loadAll.body() << "} catch (std::exception& e) {std::cerr << \"Error loading " << load->getRelation()
                        << " data: \" << e.what() << "
-                          "'\\n';}\n";
+                          "'\\n';\nexit(1);\n}\n";
     }
 
     // issue dump methods
@@ -3135,6 +3104,7 @@ void Synthesiser::generateCode(GenDb& db, const std::string& id, bool& withShare
     setNumThreads.body() << "SouffleProgram::setNumThreads(numThreadsValue);\n";
     setNumThreads.body() << "symTable.setNumLanes(getNumThreads());\n";
     setNumThreads.body() << "recordTable.setNumLanes(getNumThreads());\n";
+    setNumThreads.body() << "regexCache.setNumLanes(getNumThreads());\n";
 
     if (!prog.getSubroutines().empty()) {
         // generate subroutine adapter
@@ -3145,20 +3115,19 @@ void Synthesiser::generateCode(GenDb& db, const std::string& id, bool& withShare
         executeSubroutine.setNextArg("const std::vector<RamDomain>&", "args");
         executeSubroutine.setNextArg("std::vector<RamDomain>&", "ret");
 
-        std::size_t subroutineNum = 0;
         for (auto& sub : prog.getSubroutines()) {
             executeSubroutine.body() << "if (name == \"" << sub.first << "\") {\n"
                                      << convertStratumIdent("stratum_" + sub.first) << ".run(args, ret);\n"
                                      << "return;"
                                      << "}\n";
-            subroutineNum++;
         }
         executeSubroutine.body() << "fatal((\"unknown subroutine \" + name).c_str());\n";
     }
+
     // dumpFreqs method
     //  Frequency counts must be emitted after subroutines otherwise lookup tables
     //  are not populated.
-    if (Global::config().has("profile")) {
+    if (glb.config().has("profile")) {
         GenFunction& dumpFreqs = mainClass.addFunction("dumpFreqs", Visibility::Private);
         dumpFreqs.setRetType("void");
 
@@ -3177,26 +3146,28 @@ void Synthesiser::generateCode(GenDb& db, const std::string& id, bool& withShare
     factory.addDependency(mainClass, true);
     factory.inherits("souffle::ProgramFactory");
     GenFunction& newInstance = factory.addFunction("newInstance", Visibility::Public);
-    newInstance.setRetType("SouffleProgram*");
-    newInstance.body() << "return new " << classname << "();\n";
+    newInstance.setRetType("souffle::SouffleProgram*");
+    newInstance.body() << "return new " << db.getNS() << "::" << classname << "();\n";
     GenFunction& factoryConstructor = factory.addConstructor(Visibility::Public);
-    factoryConstructor.setNextInitializer("ProgramFactory", "\"" + id + "\"");
+    factoryConstructor.setNextInitializer("souffle::ProgramFactory", "\"" + id + "\"");
 
     std::ostream& hook = mainClass.hooks();
     std::ostream& factory_hook = factory.hooks();
 
     // hidden hooks
     hook << "namespace souffle {\n";
-    hook << "SouffleProgram *newInstance_" << id << "(){return new " << classname << ";}\n";
-    hook << "SymbolTable *getST_" << id << "(SouffleProgram *p){return &reinterpret_cast<" << classname
-         << "*>(p)->getSymbolTable();}\n";
+    hook << "SouffleProgram *newInstance_" << id << "(){return new " << db.getNS() << "::" << classname
+         << ";}\n";
+    hook << "SymbolTable *getST_" << id << "(SouffleProgram *p){return &reinterpret_cast<" << db.getNS(false)
+         << "::" << classname << "*>(p)->getSymbolTable();}\n";
 
     hook << "} // namespace souffle\n";
 
     factory_hook << "namespace souffle {\n";
     factory_hook << "\n#ifdef __EMBEDDED_SOUFFLE__\n";
     factory_hook << "extern \"C\" {\n";
-    factory_hook << "factory_" << classname << " __factory_" << classname << "_instance;\n";
+    factory_hook << db.getNS(false) << "::factory_" << classname << " __factory_" << classname
+                 << "_instance;\n";
     factory_hook << "}\n";
     factory_hook << "#endif\n";
     factory_hook << "} // namespace souffle\n";
@@ -3209,23 +3180,25 @@ void Synthesiser::generateCode(GenDb& db, const std::string& id, bool& withShare
 
     // parse arguments
     hook << "souffle::CmdOptions opt(";
-    hook << "R\"(" << Global::config().get("") << ")\",\n";
+    hook << "R\"(" << glb.config().get("") << ")\",\n";
     hook << "R\"()\",\n";
     hook << "R\"()\",\n";
-    if (Global::config().has("profile")) {
+    if (glb.config().has("profile")) {
         hook << "true,\n";
-        hook << "R\"(" << Global::config().get("profile") << ")\",\n";
+        hook << "R\"(" << glb.config().get("profile") << ")\",\n";
     } else {
         hook << "false,\n";
         hook << "R\"()\",\n";
     }
-    hook << std::stoi(Global::config().get("jobs"));
+    hook << std::stoi(glb.config().get("jobs"));
     hook << ");\n";
 
     hook << "if (!opt.parse(argc,argv)) return 1;\n";
 
-    hook << "souffle::";
-    if (Global::config().has("profile")) {
+    if (!db.getNS(false).empty()) {
+        hook << db.getNS(false) << "::";
+    }
+    if (glb.config().has("profile")) {
         hook << classname + " obj(opt.getProfileName());\n";
     } else {
         hook << classname + " obj;\n";
@@ -3235,7 +3208,7 @@ void Synthesiser::generateCode(GenDb& db, const std::string& id, bool& withShare
     hook << "obj.setNumThreads(opt.getNumJobs());\n";
     hook << "\n#endif\n";
 
-    if (Global::config().has("profile")) {
+    if (glb.config().has("profile")) {
         hook << R"_(souffle::ProfileEventSingleton::instance().makeConfigRecord("", opt.getSourceFileName());)_"
              << '\n';
         hook << R"_(souffle::ProfileEventSingleton::instance().makeConfigRecord("fact-dir", opt.getInputFileDir());)_"
@@ -3245,13 +3218,13 @@ void Synthesiser::generateCode(GenDb& db, const std::string& id, bool& withShare
         hook << R"_(souffle::ProfileEventSingleton::instance().makeConfigRecord("output-dir", opt.getOutputFileDir());)_"
              << '\n';
         hook << R"_(souffle::ProfileEventSingleton::instance().makeConfigRecord("version", ")_"
-             << Global::config().get("version") << R"_(");)_" << '\n';
+             << glb.config().get("version") << R"_(");)_" << '\n';
     }
     hook << "obj.runAll(opt.getInputFileDir(), opt.getOutputFileDir());\n";
 
-    if (Global::config().get("provenance") == "explain") {
+    if (glb.config().get("provenance") == "explain") {
         hook << "explain(obj, false);\n";
-    } else if (Global::config().get("provenance") == "explore") {
+    } else if (glb.config().get("provenance") == "explore") {
         hook << "explain(obj, true);\n";
     }
     hook << "return 0;\n";

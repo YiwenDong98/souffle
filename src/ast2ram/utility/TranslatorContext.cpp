@@ -20,6 +20,7 @@
 #include "ast/QualifiedName.h"
 #include "ast/SubsumptiveClause.h"
 #include "ast/TranslationUnit.h"
+#include "ast/UserDefinedAggregator.h"
 #include "ast/analysis/Functor.h"
 #include "ast/analysis/IOType.h"
 #include "ast/analysis/JoinSize.h"
@@ -49,6 +50,7 @@ namespace souffle::ast2ram {
 
 TranslatorContext::TranslatorContext(const ast::TranslationUnit& tu) {
     program = &tu.getProgram();
+    global = &tu.global();
 
     // Set up analyses
     functorAnalysis = &tu.getAnalysis<ast::analysis::FunctorAnalysis>();
@@ -75,13 +77,13 @@ TranslatorContext::TranslatorContext(const ast::TranslationUnit& tu) {
 
     // Set up SIPS metric
     std::string sipsChosen = "all-bound";
-    if (Global::config().has("RamSIPS")) {
-        sipsChosen = Global::config().get("RamSIPS");
+    if (global->config().has("RamSIPS")) {
+        sipsChosen = global->config().get("RamSIPS");
     }
     sipsMetric = ast::SipsMetric::create(sipsChosen, tu);
 
     // Set up the correct strategy
-    if (Global::config().has("provenance")) {
+    if (global->config().has("provenance")) {
         translationStrategy = mk<provenance::TranslationStrategy>();
     } else {
         translationStrategy = mk<seminaive::TranslationStrategy>();
@@ -195,12 +197,30 @@ bool TranslatorContext::isStatefulFunctor(const ast::UserDefinedFunctor& udf) co
     return functorAnalysis->isStatefulFunctor(udf);
 }
 
+TypeAttribute TranslatorContext::getFunctorReturnTypeAttribute(const ast::UserDefinedAggregator& uda) const {
+    return typeAnalysis->getAggregatorReturnTypeAttribute(uda);
+}
+
+TypeAttribute TranslatorContext::getFunctorParamTypeAtribute(
+        const ast::UserDefinedAggregator& uda, std::size_t idx) const {
+    return typeAnalysis->getAggregatorParamTypeAttribute(uda, idx);
+}
+
+std::vector<TypeAttribute> TranslatorContext::getFunctorParamTypeAtributes(
+        const ast::UserDefinedAggregator& uda) const {
+    return typeAnalysis->getAggregatorParamTypeAttributes(uda);
+}
+
+bool TranslatorContext::isStatefulFunctor(const ast::UserDefinedAggregator& uda) const {
+    return functorAnalysis->isStatefulFunctor(uda);
+}
+
 ast::NumericConstant::Type TranslatorContext::getInferredNumericConstantType(
         const ast::NumericConstant& nc) const {
     return polyAnalysis->getInferredType(nc);
 }
 
-AggregateOp TranslatorContext::getOverloadedAggregatorOperator(const ast::Aggregator& aggr) const {
+AggregateOp TranslatorContext::getOverloadedAggregatorOperator(const ast::IntrinsicAggregator& aggr) const {
     return polyAnalysis->getOverloadedOperator(aggr);
 }
 

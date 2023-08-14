@@ -18,6 +18,7 @@
 #include "FunctorOps.h"
 #include "ast/NumericConstant.h"
 #include "ast/QualifiedName.h"
+#include "ast/UserDefinedAggregator.h"
 #include "ast/analysis/JoinSize.h"
 #include "ast/analysis/ProfileUse.h"
 #include "ast/analysis/typesystem/Type.h"
@@ -28,6 +29,10 @@
 #include <cstddef>
 #include <set>
 #include <vector>
+
+namespace souffle {
+class Global;
+}
 
 namespace souffle::ast {
 class Aggregator;
@@ -76,6 +81,10 @@ public:
     TranslatorContext(const ast::TranslationUnit& tu);
     ~TranslatorContext();
 
+    const Global* getGlobal() const {
+        return global;
+    }
+
     const ast::Program* getProgram() const {
         return program;
     }
@@ -110,6 +119,13 @@ public:
     std::vector<TypeAttribute> getFunctorParamTypeAtributes(const ast::UserDefinedFunctor& udf) const;
     bool isStatefulFunctor(const ast::UserDefinedFunctor& functor) const;
 
+    /** Functor methods */
+    TypeAttribute getFunctorReturnTypeAttribute(const ast::UserDefinedAggregator& aggregator) const;
+    TypeAttribute getFunctorParamTypeAtribute(
+            const ast::UserDefinedAggregator& aggregator, std::size_t idx) const;
+    std::vector<TypeAttribute> getFunctorParamTypeAtributes(const ast::UserDefinedAggregator& udf) const;
+    bool isStatefulFunctor(const ast::UserDefinedAggregator& aggregator) const;
+
     /** ADT methods */
     bool isADTEnum(const ast::BranchInit* adt) const;
     int getADTBranchId(const ast::BranchInit* adt) const;
@@ -117,7 +133,7 @@ public:
 
     /** Polymorphic objects methods */
     ast::NumericConstant::Type getInferredNumericConstantType(const ast::NumericConstant& nc) const;
-    AggregateOp getOverloadedAggregatorOperator(const ast::Aggregator& aggr) const;
+    AggregateOp getOverloadedAggregatorOperator(const ast::IntrinsicAggregator& aggr) const;
     BinaryConstraintOp getOverloadedBinaryConstraintOperator(const ast::BinaryConstraint& bc) const;
     FunctorOp getOverloadedFunctorOp(const ast::IntrinsicFunctor& inf) const;
 
@@ -138,6 +154,7 @@ public:
 
 private:
     const ast::Program* program;
+    const Global* global;
     const ast::analysis::RecursiveClausesAnalysis* recursiveClauses;
     const ast::analysis::RelationScheduleAnalysis* relationSchedule;
     const ast::analysis::SCCGraphAnalysis* sccGraph;

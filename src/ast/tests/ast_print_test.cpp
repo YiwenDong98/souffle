@@ -22,6 +22,7 @@
 #include "ast/Atom.h"
 #include "ast/Clause.h"
 #include "ast/Counter.h"
+#include "ast/IntrinsicAggregator.h"
 #include "ast/Literal.h"
 #include "ast/NilConstant.h"
 #include "ast/Node.h"
@@ -44,9 +45,10 @@
 namespace souffle::ast::test {
 
 inline Own<TranslationUnit> makeATU(std::string program = ".decl A,B,C(x:number)") {
+    Global glb;
     ErrorReport e;
-    DebugReport d;
-    return ParserDriver::parseTranslationUnit(program, e, d);
+    DebugReport d(glb);
+    return ParserDriver::parseTranslationUnit(glb, program, e, d);
 }
 
 inline Own<TranslationUnit> makePrintedATU(Own<TranslationUnit>& tu) {
@@ -83,11 +85,12 @@ TEST(AstPrint, NumberConstant) {
 }
 
 TEST(AstPrint, StringConstant) {
+    Global glb;
     ErrorReport e;
-    DebugReport d;
+    DebugReport d(glb);
     auto testArgument = mk<StringConstant>("test string");
 
-    auto tu1 = ParserDriver::parseTranslationUnit(".decl A,B,C(x:number)", e, d);
+    auto tu1 = ParserDriver::parseTranslationUnit(glb, ".decl A,B,C(x:number)", e, d);
     tu1->getProgram().addClause(makeClauseA(std::move(testArgument)));
     auto tu2 = makePrintedATU(tu1);
     EXPECT_EQ(tu1->getProgram(), tu2->getProgram());
@@ -123,7 +126,7 @@ TEST(AstPrint, Counter) {
 TEST(AstPrint, AggregatorMin) {
     auto atom = mk<Atom>("B");
     atom->addArgument(mk<Variable>("x"));
-    auto min = mk<Aggregator>(AggregateOp::MIN, mk<Variable>("x"));
+    auto min = mk<IntrinsicAggregator>(AggregateOp::MIN, mk<Variable>("x"));
 
     VecOwn<Literal> body;
     body.push_back(mk<Atom>("B"));
@@ -140,7 +143,7 @@ TEST(AstPrint, AggregatorMin) {
 TEST(AstPrint, AggregatorMax) {
     auto atom = mk<Atom>("B");
     atom->addArgument(mk<Variable>("x"));
-    auto max = mk<Aggregator>(AggregateOp::MAX, mk<Variable>("x"));
+    auto max = mk<IntrinsicAggregator>(AggregateOp::MAX, mk<Variable>("x"));
 
     VecOwn<Literal> body;
     body.push_back(std::move(atom));
@@ -156,7 +159,7 @@ TEST(AstPrint, AggregatorMax) {
 TEST(AstPrint, AggregatorCount) {
     auto atom = mk<Atom>("B");
     atom->addArgument(mk<Variable>("x"));
-    auto count = mk<Aggregator>(AggregateOp::COUNT);
+    auto count = mk<IntrinsicAggregator>(AggregateOp::COUNT);
 
     VecOwn<Literal> body;
     body.push_back(std::move(atom));
@@ -172,7 +175,7 @@ TEST(AstPrint, AggregatorCount) {
 TEST(AstPrint, AggregatorSum) {
     auto atom = mk<Atom>("B");
     atom->addArgument(mk<Variable>("x"));
-    auto sum = mk<Aggregator>(AggregateOp::SUM, mk<Variable>("x"));
+    auto sum = mk<IntrinsicAggregator>(AggregateOp::SUM, mk<Variable>("x"));
 
     VecOwn<Literal> body;
     body.push_back(std::move(atom));

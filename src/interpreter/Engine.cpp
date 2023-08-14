@@ -23,6 +23,7 @@
 #include "interpreter/Relation.h"
 #include "interpreter/ViewContext.h"
 #include "ram/Aggregate.h"
+#include "ram/Aggregator.h"
 #include "ram/AutoIncrement.h"
 #include "ram/Break.h"
 #include "ram/Call.h"
@@ -43,6 +44,7 @@
 #include "ram/IndexIfExists.h"
 #include "ram/IndexScan.h"
 #include "ram/Insert.h"
+#include "ram/IntrinsicAggregator.h"
 #include "ram/IntrinsicOperator.h"
 #include "ram/LogRelationTimer.h"
 #include "ram/LogSize.h"
@@ -77,6 +79,7 @@
 #include "ram/TupleElement.h"
 #include "ram/TupleOperation.h"
 #include "ram/UnpackRecord.h"
+#include "ram/UserDefinedAggregator.h"
 #include "ram/UserDefinedOperator.h"
 #include "ram/utility/Visitor.h"
 #include "souffle/BinaryConstraintOps.h"
@@ -85,6 +88,7 @@
 #include "souffle/SignalHandler.h"
 #include "souffle/SymbolTable.h"
 #include "souffle/TypeAttribute.h"
+#include "souffle/datastructure/RecordTableImpl.h"
 #include "souffle/datastructure/SymbolTableImpl.h"
 #include "souffle/io/IOSystem.h"
 #include "souffle/io/ReadStream.h"
@@ -188,6 +192,17 @@ RamDomain callStateful(ExecuteFn&& execute, Context& ctxt, Shadow& shadow, void 
     return callWithTuple<RamDomain>(userFunctor, argsTuple);
 }
 
+/** Call a stateful aggregate functor. */
+template <typename AnyFunctor>
+RamDomain callStatefulAggregate(AnyFunctor&& userFunctor, souffle::SymbolTable* symbolTable,
+        souffle::RecordTable* recordTable, souffle::RamDomain arg1, souffle::RamDomain arg2) {
+    std::array<RamDomain, 2> args;
+    args[0] = arg1;
+    args[1] = arg2;
+    auto argsTuple = statefulCallTuple(symbolTable, recordTable, args, std::make_index_sequence<2>{});
+    return callWithTuple<RamDomain>(std::forward<AnyFunctor>(userFunctor), argsTuple);
+}
+
 /**
  * Governs the maximum supported arity for stateless functors.
  *
@@ -285,12 +300,12 @@ RamDomain callStateless(ExecuteFn&& execute, Context& ctxt, Shadow& shadow, souf
 
 }  // namespace
 
-Engine::Engine(ram::TranslationUnit& tUnit)
-        : profileEnabled(Global::config().has("profile")),
-          frequencyCounterEnabled(Global::config().has("profile-frequency")),
-          numOfThreads(number_of_threads(std::stoi(Global::config().get("jobs")))), tUnit(tUnit),
+Engine::Engine(ram::TranslationUnit& tUnit, const std::size_t numberOfThreadsOrZero)
+        : tUnit(tUnit), global(tUnit.global()), profileEnabled(global.config().has("profile")),
+          frequencyCounterEnabled(global.config().has("profile-frequency")),
+          numOfThreads(number_of_threads(numberOfThreadsOrZero)),
           isa(tUnit.getAnalysis<ram::analysis::IndexAnalysis>()), recordTable(numOfThreads),
-          symbolTable(numOfThreads) {}
+          symbolTable(numOfThreads), regexCache(numOfThreads) {}
 
 Engine::RelationHandle& Engine::getRelationHandle(const std::size_t idx) {
     return *relations[idx];
@@ -304,6 +319,14 @@ void Engine::swapRelation(const std::size_t ramRel1, const std::size_t ramRel2) 
 
 RamDomain Engine::incCounter() {
     return counter++;
+}
+
+Global& Engine::getGlobal() {
+    return global;
+}
+
+SymbolTable& Engine::getSymbolTable() {
+    return symbolTable;
 }
 
 RecordTable& Engine::getRecordTable() {
@@ -352,19 +375,19 @@ const std::vector<void*>& Engine::loadDLL() {
         return dll;
     }
 
-    if (!Global::config().has("libraries")) {
-        Global::config().set("libraries", "functors");
+    if (!global.config().has("libraries")) {
+        global.config().set("libraries", "functors");
     }
-    if (!Global::config().has("library-dir")) {
-        Global::config().set("library-dir", ".");
+    if (!global.config().has("library-dir")) {
+        global.config().set("library-dir", ".");
     }
 
-    for (auto&& library : Global::config().getMany("libraries")) {
+    for (auto&& library : global.config().getMany("libraries")) {
         // The library may be blank
         if (library.empty()) {
             continue;
         }
-        auto paths = Global::config().getMany("library-dir");
+        auto paths = global.config().getMany("library-dir");
         // Set up our paths to have a library appended
         for (std::string& path : paths) {
             if (path.back() != pathSeparator) {
@@ -381,7 +404,11 @@ const std::vector<void*>& Engine::loadDLL() {
         void* tmp = nullptr;
         for (const std::string& path : paths) {
             std::string fullpath = path + "lib" + library + dynamicLibSuffix;
+#ifndef EMSCRIPTEN
             tmp = dlopen(fullpath.c_str(), RTLD_LAZY);
+#else
+            tmp = nullptr;
+#endif
             if (tmp != nullptr) {
                 dll.push_back(tmp);
                 break;
@@ -404,7 +431,7 @@ void Engine::resetIterationNumber() {
 
 void Engine::executeMain() {
     SignalHandler::instance()->set();
-    if (Global::config().has("verbose")) {
+    if (global.config().has("verbose")) {
         SignalHandler::instance()->enableLogging();
     }
 
@@ -419,7 +446,7 @@ void Engine::executeMain() {
         Context ctxt;
         execute(main.get(), ctxt);
     } else {
-        ProfileEventSingleton::instance().setOutputFile(Global::config().get("profile"));
+        ProfileEventSingleton::instance().setOutputFile(global.config().get("profile"));
         // Prepare the frequency table for threaded use
         const ram::Program& program = tUnit.getProgram();
         visit(program, [&](const ram::TupleOperation& node) {
@@ -432,7 +459,7 @@ void Engine::executeMain() {
         ProfileEventSingleton::instance().startTimer();
         ProfileEventSingleton::instance().makeTimeEvent("@time;starttime");
         // Store configuration
-        for (auto&& [k, vs] : Global::config().data())
+        for (auto&& [k, vs] : global.config().data())
             for (auto&& v : vs)
                 ProfileEventSingleton::instance().makeConfigRecord(k, v);
 
@@ -753,7 +780,7 @@ RamDomain Engine::execute(const Node* node, Context& ctxt) {
                     fatal("ICE: functor `%s` must map onto `NestedIntrinsicOperator`", cur.getOperator());
             }
 
-            { UNREACHABLE_BAD_CASE_ANALYSIS }
+        {UNREACHABLE_BAD_CASE_ANALYSIS}
 
 #undef BINARY_OP_LOGICAL
 #undef BINARY_OP_INTEGRAL
@@ -787,7 +814,7 @@ RamDomain Engine::execute(const Node* node, Context& ctxt) {
                 case ram::NestedIntrinsicOp::FRANGE: return RUN_RANGE(RamFloat);
             }
 
-            { UNREACHABLE_BAD_CASE_ANALYSIS }
+        {UNREACHABLE_BAD_CASE_ANALYSIS}
 #undef RUN_RANGE
         ESAC(NestedIntrinsicOperator)
 
@@ -1005,30 +1032,53 @@ RamDomain Engine::execute(const Node* node, Context& ctxt) {
                 COMPARE(GE, >=)
 
                 case BinaryConstraintOp::MATCH: {
-                    RamDomain left = execute(shadow.getLhs(), ctxt);
-                    RamDomain right = execute(shadow.getRhs(), ctxt);
-                    const std::string& pattern = getSymbolTable().decode(left);
-                    const std::string& text = getSymbolTable().decode(right);
                     bool result = false;
-                    try {
-                        result = std::regex_match(text, std::regex(pattern));
-                    } catch (...) {
-                        std::cerr << "warning: wrong pattern provided for match(\"" << pattern << "\",\""
-                                  << text << "\").\n";
+                    RamDomain right = execute(shadow.getRhs(), ctxt);
+                    const std::string& text = getSymbolTable().decode(right);
+
+                    const Node* patternNode = shadow.getLhs();
+                    if (const RegexConstant* regexNode = dynamic_cast<const RegexConstant*>(patternNode);
+                            regexNode) {
+                        const auto& regex = regexNode->getRegex();
+                        if (regex) {
+                            result = std::regex_match(text, *regex);
+                        }
+                    } else {
+                        RamDomain left = execute(patternNode, ctxt);
+                        const std::string& pattern = getSymbolTable().decode(left);
+                        try {
+                            const std::regex& regex = regexCache.getOrCreate(pattern);
+                            result = std::regex_match(text, regex);
+                        } catch (...) {
+                            std::cerr << "warning: wrong pattern provided for match(\"" << pattern << "\",\""
+                                      << text << "\").\n";
+                        }
                     }
+
                     return result;
                 }
                 case BinaryConstraintOp::NOT_MATCH: {
-                    RamDomain left = execute(shadow.getLhs(), ctxt);
-                    RamDomain right = execute(shadow.getRhs(), ctxt);
-                    const std::string& pattern = getSymbolTable().decode(left);
-                    const std::string& text = getSymbolTable().decode(right);
                     bool result = false;
-                    try {
-                        result = !std::regex_match(text, std::regex(pattern));
-                    } catch (...) {
-                        std::cerr << "warning: wrong pattern provided for !match(\"" << pattern << "\",\""
-                                  << text << "\").\n";
+                    RamDomain right = execute(shadow.getRhs(), ctxt);
+                    const std::string& text = getSymbolTable().decode(right);
+
+                    const Node* patternNode = shadow.getLhs();
+                    if (const RegexConstant* regexNode = dynamic_cast<const RegexConstant*>(patternNode);
+                            regexNode) {
+                        const auto& regex = regexNode->getRegex();
+                        if (regex) {
+                            result = !std::regex_match(text, *regex);
+                        }
+                    } else {
+                        RamDomain left = execute(patternNode, ctxt);
+                        const std::string& pattern = getSymbolTable().decode(left);
+                        try {
+                            const std::regex& regex = regexCache.getOrCreate(pattern);
+                            result = !std::regex_match(text, regex);
+                        } catch (...) {
+                            std::cerr << "warning: wrong pattern provided for !match(\"" << pattern << "\",\""
+                                      << text << "\").\n";
+                        }
                     }
                     return result;
                 }
@@ -1048,7 +1098,7 @@ RamDomain Engine::execute(const Node* node, Context& ctxt) {
                 }
             }
 
-            { UNREACHABLE_BAD_CASE_ANALYSIS }
+        {UNREACHABLE_BAD_CASE_ANALYSIS}
 
 #undef COMPARE_NUMERIC
 #undef COMPARE_STRING
@@ -1168,11 +1218,10 @@ RamDomain Engine::execute(const Node* node, Context& ctxt) {
         FOR_EACH(PARALLEL_AGGREGATE)
 #undef PARALLEL_AGGREGATE
 
-#define AGGREGATE(Structure, Arity, ...)                                                                  \
-    CASE(Aggregate, Structure, Arity)                                                                     \
-        const auto& rel = *static_cast<RelType*>(shadow.getRelation());                                   \
-        return evalAggregate(cur, *shadow.getCondition(), shadow.getExpr(), *shadow.getNestedOperation(), \
-                rel.scan(), ctxt);                                                                        \
+#define AGGREGATE(Structure, Arity, ...)                                \
+    CASE(Aggregate, Structure, Arity)                                   \
+        const auto& rel = *static_cast<RelType*>(shadow.getRelation()); \
+        return evalAggregate(cur, shadow, rel.scan(), ctxt);            \
     ESAC(Aggregate)
 
         FOR_EACH(AGGREGATE)
@@ -1349,6 +1398,7 @@ RamDomain Engine::execute(const Node* node, Context& ctxt) {
                             ->readAll(rel);
                 } catch (std::exception& e) {
                     std::cerr << "Error loading " << rel.getName() << " data: " << e.what() << "\n";
+                    exit(EXIT_FAILURE);
                 }
                 return true;
             } else if (op == "output" || op == "printsize") {
@@ -1530,7 +1580,7 @@ RamDomain Engine::evalParallelScan(
         const Rel& rel, const ram::ParallelScan& cur, const ParallelScan& shadow, Context& ctxt) {
     auto viewContext = shadow.getViewContext();
 
-    auto pStream = rel.partitionScan(numOfThreads);
+    auto pStream = rel.partitionScan(numOfThreads * 20);
 
     PARALLEL_START
         Context newCtxt(ctxt);
@@ -1705,7 +1755,7 @@ RamDomain Engine::evalParallelIndexScan(
     CAL_SEARCH_BOUND(superInfo, low, high);
 
     std::size_t indexPos = shadow.getViewId();
-    auto pStream = rel.partitionRange(indexPos, low, high, numOfThreads);
+    auto pStream = rel.partitionRange(indexPos, low, high, numOfThreads * 20);
     PARALLEL_START
         Context newCtxt(ctxt);
         auto viewInfo = viewContext->getViewInfoForNested();
@@ -1750,7 +1800,7 @@ RamDomain Engine::evalParallelIfExists(
         const Rel& rel, const ram::ParallelIfExists& cur, const ParallelIfExists& shadow, Context& ctxt) {
     auto viewContext = shadow.getViewContext();
 
-    auto pStream = rel.partitionScan(numOfThreads);
+    auto pStream = rel.partitionScan(numOfThreads * 20);
     auto viewInfo = viewContext->getViewInfoForNested();
     PARALLEL_START
         Context newCtxt(ctxt);
@@ -1814,7 +1864,7 @@ RamDomain Engine::evalParallelIndexIfExists(const Rel& rel, const ram::ParallelI
     CAL_SEARCH_BOUND(superInfo, low, high);
 
     std::size_t indexPos = shadow.getViewId();
-    auto pStream = rel.partitionRange(indexPos, low, high, numOfThreads);
+    auto pStream = rel.partitionRange(indexPos, low, high, numOfThreads * 20);
 
     PARALLEL_START
         Context newCtxt(ctxt);
@@ -1842,49 +1892,68 @@ RamDomain Engine::evalParallelIndexIfExists(const Rel& rel, const ram::ParallelI
     return true;
 }
 
-template <typename Aggregate, typename Iter>
-RamDomain Engine::evalAggregate(const Aggregate& aggregate, const Node& filter, const Node* expression,
-        const Node& nestedOperation, const Iter& ranges, Context& ctxt) {
+template <typename Shadow>
+RamDomain Engine::initValue(const ram::Aggregator& aggregator, const Shadow& shadow, Context& ctxt) {
+    if (const auto* ia = as<ram::IntrinsicAggregator>(aggregator)) {
+        switch (ia->getFunction()) {
+            case AggregateOp::MIN: return ramBitCast(MAX_RAM_SIGNED);
+            case AggregateOp::UMIN: return ramBitCast(MAX_RAM_UNSIGNED);
+            case AggregateOp::FMIN: return ramBitCast(MAX_RAM_FLOAT);
+            case AggregateOp::MAX: return ramBitCast(MIN_RAM_SIGNED);
+            case AggregateOp::UMAX: return ramBitCast(MIN_RAM_UNSIGNED);
+            case AggregateOp::FMAX: return ramBitCast(MIN_RAM_FLOAT);
+            case AggregateOp::SUM: return ramBitCast(static_cast<RamSigned>(0));
+            case AggregateOp::USUM: return ramBitCast(static_cast<RamUnsigned>(0));
+            case AggregateOp::FSUM: return ramBitCast(static_cast<RamFloat>(0));
+            case AggregateOp::MEAN: return 0;
+            case AggregateOp::COUNT: return 0;
+        }
+    } else if (isA<ram::UserDefinedAggregator>(aggregator)) {
+        return execute(shadow.getInit(), ctxt);
+    }
+    fatal("Unhandled aggregator");
+}
+
+bool runNested(const ram::Aggregator& aggregator) {
+    if (const auto* ia = as<ram::IntrinsicAggregator>(aggregator)) {
+        switch (ia->getFunction()) {
+            case AggregateOp::COUNT:
+            case AggregateOp::FSUM:
+            case AggregateOp::USUM:
+            case AggregateOp::SUM: return true;
+            default: return false;
+        }
+    } else if (isA<ram::UserDefinedAggregator>(aggregator)) {
+        return false;
+    }
+    return false;
+}
+
+void ifIntrinsic(const ram::Aggregator& aggregator, AggregateOp op, std::function<void()> fn) {
+    if (const auto* ia = as<ram::IntrinsicAggregator>(aggregator)) {
+        if (ia->getFunction() == op) {
+            fn();
+        };
+    }
+}
+
+template <typename Aggregate, typename Shadow, typename Iter>
+RamDomain Engine::evalAggregate(
+        const Aggregate& aggregate, const Shadow& shadow, const Iter& ranges, Context& ctxt) {
     bool shouldRunNested = false;
 
+    const Node& filter = *shadow.getCondition();
+    const Node* expression = shadow.getExpr();
+    const Node& nestedOperation = *shadow.getNestedOperation();
     // initialize result
     RamDomain res = 0;
 
     // Use for calculating mean.
-    std::pair<RamFloat, RamFloat> accumulateMean;
+    std::pair<RamFloat, RamFloat> accumulateMean = {0, 0};
 
-    switch (aggregate.getFunction()) {
-        case AggregateOp::MIN: res = ramBitCast(MAX_RAM_SIGNED); break;
-        case AggregateOp::UMIN: res = ramBitCast(MAX_RAM_UNSIGNED); break;
-        case AggregateOp::FMIN: res = ramBitCast(MAX_RAM_FLOAT); break;
-
-        case AggregateOp::MAX: res = ramBitCast(MIN_RAM_SIGNED); break;
-        case AggregateOp::UMAX: res = ramBitCast(MIN_RAM_UNSIGNED); break;
-        case AggregateOp::FMAX: res = ramBitCast(MIN_RAM_FLOAT); break;
-
-        case AggregateOp::SUM:
-            res = ramBitCast(static_cast<RamSigned>(0));
-            shouldRunNested = true;
-            break;
-        case AggregateOp::USUM:
-            res = ramBitCast(static_cast<RamUnsigned>(0));
-            shouldRunNested = true;
-            break;
-        case AggregateOp::FSUM:
-            res = ramBitCast(static_cast<RamFloat>(0));
-            shouldRunNested = true;
-            break;
-
-        case AggregateOp::MEAN:
-            res = 0;
-            accumulateMean = {0, 0};
-            break;
-
-        case AggregateOp::COUNT:
-            res = 0;
-            shouldRunNested = true;
-            break;
-    }
+    const ram::Aggregator& aggregator = aggregate.getAggregator();
+    res = initValue(aggregator, shadow, ctxt);
+    shouldRunNested = runNested(aggregator);
 
     for (const auto& tuple : ranges) {
         ctxt[aggregate.getTupleId()] = tuple.data();
@@ -1895,8 +1964,11 @@ RamDomain Engine::evalAggregate(const Aggregate& aggregate, const Node& filter, 
 
         shouldRunNested = true;
 
+        bool isCount = false;
+        ifIntrinsic(aggregator, AggregateOp::COUNT, [&]() { isCount = true; });
+
         // count is a special case.
-        if (aggregate.getFunction() == AggregateOp::COUNT) {
+        if (isCount) {
             ++res;
             continue;
         }
@@ -1905,43 +1977,56 @@ RamDomain Engine::evalAggregate(const Aggregate& aggregate, const Node& filter, 
         assert(expression);  // only case where this is null is `COUNT`
         RamDomain val = execute(expression, ctxt);
 
-        switch (aggregate.getFunction()) {
-            case AggregateOp::MIN: res = std::min(res, val); break;
-            case AggregateOp::FMIN:
-                res = ramBitCast(std::min(ramBitCast<RamFloat>(res), ramBitCast<RamFloat>(val)));
-                break;
-            case AggregateOp::UMIN:
-                res = ramBitCast(std::min(ramBitCast<RamUnsigned>(res), ramBitCast<RamUnsigned>(val)));
-                break;
+        if (const auto* ia = as<ram::IntrinsicAggregator>(aggregator)) {
+            switch (ia->getFunction()) {
+                case AggregateOp::MIN: res = std::min(res, val); break;
+                case AggregateOp::FMIN:
+                    res = ramBitCast(std::min(ramBitCast<RamFloat>(res), ramBitCast<RamFloat>(val)));
+                    break;
+                case AggregateOp::UMIN:
+                    res = ramBitCast(std::min(ramBitCast<RamUnsigned>(res), ramBitCast<RamUnsigned>(val)));
+                    break;
 
-            case AggregateOp::MAX: res = std::max(res, val); break;
-            case AggregateOp::FMAX:
-                res = ramBitCast(std::max(ramBitCast<RamFloat>(res), ramBitCast<RamFloat>(val)));
-                break;
-            case AggregateOp::UMAX:
-                res = ramBitCast(std::max(ramBitCast<RamUnsigned>(res), ramBitCast<RamUnsigned>(val)));
-                break;
+                case AggregateOp::MAX: res = std::max(res, val); break;
+                case AggregateOp::FMAX:
+                    res = ramBitCast(std::max(ramBitCast<RamFloat>(res), ramBitCast<RamFloat>(val)));
+                    break;
+                case AggregateOp::UMAX:
+                    res = ramBitCast(std::max(ramBitCast<RamUnsigned>(res), ramBitCast<RamUnsigned>(val)));
+                    break;
 
-            case AggregateOp::SUM: res += val; break;
-            case AggregateOp::FSUM:
-                res = ramBitCast(ramBitCast<RamFloat>(res) + ramBitCast<RamFloat>(val));
-                break;
-            case AggregateOp::USUM:
-                res = ramBitCast(ramBitCast<RamUnsigned>(res) + ramBitCast<RamUnsigned>(val));
-                break;
+                case AggregateOp::SUM: res += val; break;
+                case AggregateOp::FSUM:
+                    res = ramBitCast(ramBitCast<RamFloat>(res) + ramBitCast<RamFloat>(val));
+                    break;
+                case AggregateOp::USUM:
+                    res = ramBitCast(ramBitCast<RamUnsigned>(res) + ramBitCast<RamUnsigned>(val));
+                    break;
 
-            case AggregateOp::MEAN:
-                accumulateMean.first += ramBitCast<RamFloat>(val);
-                accumulateMean.second++;
-                break;
+                case AggregateOp::MEAN:
+                    accumulateMean.first += ramBitCast<RamFloat>(val);
+                    accumulateMean.second++;
+                    break;
 
-            case AggregateOp::COUNT: fatal("This should never be executed");
+                case AggregateOp::COUNT: fatal("This should never be executed");
+            }
+        } else if (const auto* uda = as<ram::UserDefinedAggregator>(aggregator)) {
+            auto userFunctorPtr = reinterpret_cast<void (*)()>(shadow.getFunctionPointer());
+            if (uda->isStateful() && userFunctorPtr) {
+                res = callStatefulAggregate(userFunctorPtr, &getSymbolTable(), &getRecordTable(), res, val);
+            } else {
+                fatal("stateless functors not supported in user-defined aggregates");
+            }
+        } else {
+            fatal("Unhandled aggregator");
         }
     }
 
-    if (aggregate.getFunction() == AggregateOp::MEAN && accumulateMean.second != 0) {
-        res = ramBitCast(accumulateMean.first / accumulateMean.second);
-    }
+    ifIntrinsic(aggregator, AggregateOp::MEAN, [&]() {
+        if (accumulateMean.second != 0) {
+            res = ramBitCast(accumulateMean.first / accumulateMean.second);
+        }
+    });
 
     // write result to environment
     souffle::Tuple<RamDomain, 1> tuple;
@@ -1965,8 +2050,7 @@ RamDomain Engine::evalParallelAggregate(
     for (const auto& info : viewInfo) {
         newCtxt.createView(*getRelationHandle(info[0]), info[1], info[2]);
     }
-    return evalAggregate(
-            cur, *shadow.getCondition(), shadow.getExpr(), *shadow.getNestedOperation(), rel.scan(), newCtxt);
+    return evalAggregate(cur, shadow, rel.scan(), newCtxt);
 }
 
 template <typename Rel>
@@ -1991,8 +2075,7 @@ RamDomain Engine::evalParallelIndexAggregate(
     std::size_t viewId = shadow.getViewId();
     auto view = Rel::castView(newCtxt.getView(viewId));
 
-    return evalAggregate(cur, *shadow.getCondition(), shadow.getExpr(), *shadow.getNestedOperation(),
-            view->range(low, high), newCtxt);
+    return evalAggregate(cur, shadow, view->range(low, high), newCtxt);
 }
 
 template <typename Rel>
@@ -2008,8 +2091,7 @@ RamDomain Engine::evalIndexAggregate(
     std::size_t viewId = shadow.getViewId();
     auto view = Rel::castView(ctxt.getView(viewId));
 
-    return evalAggregate(cur, *shadow.getCondition(), shadow.getExpr(), *shadow.getNestedOperation(),
-            view->range(low, high), ctxt);
+    return evalAggregate(cur, shadow, view->range(low, high), ctxt);
 }
 
 template <typename Rel>

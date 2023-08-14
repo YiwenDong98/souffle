@@ -35,6 +35,7 @@
 #include "ast/ExecutionOrder.h"
 #include "ast/ExecutionPlan.h"
 #include "ast/Functor.h"
+#include "ast/IntrinsicAggregator.h"
 #include "ast/IntrinsicFunctor.h"
 #include "ast/Literal.h"
 #include "ast/Negation.h"
@@ -109,11 +110,11 @@ private:
     const Program& program = tu.getProgram();
     ErrorReport& report = tu.getErrorReport();
 
-    void checkAtom(const Atom& atom);
-    void checkLiteral(const Literal& literal);
-    void checkAggregator(const Aggregator& aggregator);
+    void checkAtom(const Clause& parent, const Atom& atom);
+    void checkLiteral(const Clause& parent, const Literal& literal);
+    void checkAggregator(const Clause& parent, const Aggregator& aggregator);
     bool isDependent(const Clause& agg1, const Clause& agg2);
-    void checkArgument(const Argument& arg);
+    void checkArgument(const Clause& parent, const Argument& arg);
     void checkConstant(const Argument& argument);
     void checkFact(const Clause& fact);
     void checkClause(const Clause& clause);
@@ -137,9 +138,9 @@ bool SemanticChecker::transform(TranslationUnit& translationUnit) {
 
 SemanticCheckerImpl::SemanticCheckerImpl(TranslationUnit& tu) : tu(tu) {
     // suppress warnings for given relations
-    if (Global::config().has("suppress-warnings")) {
+    if (tu.global().config().has("suppress-warnings")) {
         std::vector<std::string> suppressedRelations =
-                splitString(Global::config().get("suppress-warnings"), ',');
+                splitString(tu.global().config().get("suppress-warnings"), ',');
 
         if (std::find(suppressedRelations.begin(), suppressedRelations.end(), "*") !=
                 suppressedRelations.end()) {
@@ -235,7 +236,7 @@ SemanticCheckerImpl::SemanticCheckerImpl(TranslationUnit& tu) : tu(tu) {
     }
 }
 
-void SemanticCheckerImpl::checkAtom(const Atom& atom) {
+void SemanticCheckerImpl::checkAtom(const Clause& parent, const Atom& atom) {
     // check existence of relation
     auto* r = program.getRelation(atom);
     if (r == nullptr) {
@@ -250,7 +251,7 @@ void SemanticCheckerImpl::checkAtom(const Atom& atom) {
     }
 
     for (const Argument* arg : atom.getArguments()) {
-        checkArgument(*arg);
+        checkArgument(parent, *arg);
     }
 }
 
@@ -277,19 +278,19 @@ std::set<const UnnamedVariable*> getUnnamedVariables(const Node& node) {
 
 }  // namespace
 
-void SemanticCheckerImpl::checkLiteral(const Literal& literal) {
+void SemanticCheckerImpl::checkLiteral(const Clause& parent, const Literal& literal) {
     // check potential nested atom
     if (const auto* atom = as<Atom>(literal)) {
-        checkAtom(*atom);
+        checkAtom(parent, *atom);
     }
 
     if (const auto* neg = as<Negation>(literal)) {
-        checkAtom(*neg->getAtom());
+        checkAtom(parent, *neg->getAtom());
     }
 
     if (const auto* constraint = as<BinaryConstraint>(literal)) {
-        checkArgument(*constraint->getLHS());
-        checkArgument(*constraint->getRHS());
+        checkArgument(parent, *constraint->getLHS());
+        checkArgument(parent, *constraint->getRHS());
 
         std::set<const UnnamedVariable*> unnamedInRecord;
         visit(*constraint, [&](const RecordInit& record) {
@@ -346,12 +347,11 @@ bool SemanticCheckerImpl::isDependent(const Clause& agg1, const Clause& agg2) {
     return dependent;
 }
 
-void SemanticCheckerImpl::checkAggregator(const Aggregator& aggregator) {
+void SemanticCheckerImpl::checkAggregator(const Clause& parent, const Aggregator& aggregator) {
     auto& report = tu.getErrorReport();
-    const Program& program = tu.getProgram();
     Clause dummyClauseAggregator("dummy");
 
-    visit(program, [&](const Literal& parentLiteral) {
+    visit(parent, [&](const Literal& parentLiteral) {
         visit(parentLiteral, [&](const Aggregator& candidateAggregate) {
             if (candidateAggregate != aggregator) {
                 return;
@@ -362,7 +362,7 @@ void SemanticCheckerImpl::checkAggregator(const Aggregator& aggregator) {
         });
     });
 
-    visit(program, [&](const Literal& parentLiteral) {
+    visit(parent, [&](const Literal& parentLiteral) {
         visit(parentLiteral, [&](const Aggregator& /* otherAggregate */) {
             // Create the other aggregate's dummy clause
             Clause dummyClauseOther("dummy");
@@ -376,16 +376,16 @@ void SemanticCheckerImpl::checkAggregator(const Aggregator& aggregator) {
     });
 
     for (Literal* literal : aggregator.getBodyLiterals()) {
-        checkLiteral(*literal);
+        checkLiteral(parent, *literal);
     }
 }
 
-void SemanticCheckerImpl::checkArgument(const Argument& arg) {
+void SemanticCheckerImpl::checkArgument(const Clause& parent, const Argument& arg) {
     if (const auto* agg = as<Aggregator>(arg)) {
-        checkAggregator(*agg);
+        checkAggregator(parent, *agg);
     } else if (const auto* func = as<Functor>(arg)) {
         for (auto arg : func->getArguments()) {
-            checkArgument(*arg);
+            checkArgument(parent, *arg);
         }
 
         if (auto const* udFunc = as<UserDefinedFunctor const>(func)) {
@@ -454,7 +454,7 @@ void SemanticCheckerImpl::checkFact(const Clause& fact) {
 
 void SemanticCheckerImpl::checkClause(const Clause& clause) {
     // check head atom
-    checkAtom(*clause.getHead());
+    checkAtom(clause, *clause.getHead());
 
     // Check for absence of underscores in head
     for (auto* unnamed : getUnnamedVariables(*clause.getHead())) {
@@ -463,7 +463,7 @@ void SemanticCheckerImpl::checkClause(const Clause& clause) {
 
     // check body literals
     for (Literal* lit : clause.getBodyLiterals()) {
-        checkLiteral(*lit);
+        checkLiteral(clause, *lit);
     }
 
     // check facts
@@ -498,7 +498,8 @@ void SemanticCheckerImpl::checkClause(const Clause& clause) {
         if (varName[0] == '_') {
             assert(varName.size() > 1 && "named variable should not be a single underscore");
             if (numAppearances > 1) {
-                report.addWarning("Variable " + varName + " marked as singleton but occurs more than once",
+                report.addWarning(WarnType::VarAppearsOnce,
+                        "Variable " + varName + " marked as singleton but occurs more than once",
                         varLocation);
             }
         }
@@ -548,7 +549,8 @@ void SemanticCheckerImpl::checkComplexRule(const std::set<const Clause*>& multiR
         const auto& varName = cur.first;
         const auto& varLocation = var_pos[varName]->getSrcLoc();
         if (varName[0] != '_' && numAppearances == 1) {
-            report.addWarning("Variable " + varName + " only occurs once", varLocation);
+            report.addWarning(
+                    WarnType::VarAppearsOnce, "Variable " + varName + " only occurs once", varLocation);
         }
     }
 }
@@ -643,7 +645,8 @@ void SemanticCheckerImpl::checkRelation(const Relation& relation) {
         return sClause.getHead()->getQualifiedName() == relation.getQualifiedName();
     });
     if (relation.getRepresentation() == RelationRepresentation::BTREE_DELETE && !hasSubsumptiveRule) {
-        report.addWarning("No subsumptive rule for relation " + toString(relation.getQualifiedName()),
+        report.addWarning(WarnType::NoSubsumptiveRule,
+                "No subsumptive rule for relation " + toString(relation.getQualifiedName()),
                 relation.getSrcLoc());
     } else if (relation.getRepresentation() != RelationRepresentation::BTREE_DELETE && hasSubsumptiveRule) {
         report.addError("Relation \"" + toString(relation.getQualifiedName()) +
@@ -666,7 +669,8 @@ void SemanticCheckerImpl::checkRelation(const Relation& relation) {
     // check whether this relation is empty
     if (program.getClauses(relation).empty() && !ioTypes.isInput(&relation) &&
             !relation.hasQualifier(RelationQualifier::SUPPRESSED)) {
-        report.addWarning("No rules/facts defined for relation " + toString(relation.getQualifiedName()),
+        report.addWarning(WarnType::NoRulesNorFacts,
+                "No rules/facts defined for relation " + toString(relation.getQualifiedName()),
                 relation.getSrcLoc());
     }
 }
@@ -695,7 +699,7 @@ void SemanticCheckerImpl::checkIO() {
  *
  **/
 static const std::vector<SrcLocation> usesInvalidWitness(
-        TranslationUnit& tu, const Clause& clause, const Aggregator& aggregate) {
+        TranslationUnit& tu, const Clause& clause, const IntrinsicAggregator& aggregate) {
     std::vector<SrcLocation> invalidWitnessLocations;
 
     if (aggregate.getBaseOperator() == AggregateOp::MIN || aggregate.getBaseOperator() == AggregateOp::MAX) {
@@ -742,7 +746,7 @@ void SemanticCheckerImpl::checkWitnessProblem() {
     // an aggregate where it doesn't make sense to use it, i.e.
     // count, sum, mean
     visit(program, [&](const Clause& clause) {
-        visit(clause, [&](const Aggregator& agg) {
+        visit(clause, [&](const IntrinsicAggregator& agg) {
             for (auto&& invalidArgument : usesInvalidWitness(tu, clause, agg)) {
                 report.addError(
                         "Witness problem: argument grounded by an aggregator's inner scope is used "

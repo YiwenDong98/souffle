@@ -343,6 +343,9 @@ private:
     SuperInstruction getInsertSuperInstInfo(const ram::Insert& exist);
     SuperInstruction getEraseSuperInstInfo(const ram::Erase& exist);
 
+    NodePtr mkInit(const ram::AbstractAggregate& aggregate);
+    void* resolveFunctionPointers(const ram::AbstractAggregate& aggregate);
+
     /** Environment encoding, store a mapping from ram::Node to its operation index id. */
     std::unordered_map<const ram::Node*, std::size_t> indexTable;
     /** Points to the current viewContext during the generation.
@@ -363,5 +366,7 @@ private:
     OrderingContext orderingContext = OrderingContext(*this);
     /** Reference to the engine instance */
     Engine& engine;
+    /** Reference to global */
+    Global& global;
 };
 }  // namespace souffle::interpreter

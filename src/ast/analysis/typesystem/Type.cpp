@@ -23,6 +23,7 @@
 #include "ast/BinaryConstraint.h"
 #include "ast/BranchInit.h"
 #include "ast/Clause.h"
+#include "ast/IntrinsicAggregator.h"
 #include "ast/IntrinsicFunctor.h"
 #include "ast/Negation.h"
 #include "ast/NumericConstant.h"
@@ -30,10 +31,12 @@
 #include "ast/Relation.h"
 #include "ast/TranslationUnit.h"
 #include "ast/TypeCast.h"
+#include "ast/UserDefinedAggregator.h"
 #include "ast/UserDefinedFunctor.h"
 #include "ast/Variable.h"
 #include "ast/analysis/Constraint.h"
 #include "ast/analysis/ConstraintSystem.h"
+#include "ast/analysis/ErrorAnalyzer.h"
 #include "ast/analysis/typesystem/SumTypeBranches.h"
 #include "ast/analysis/typesystem/TypeConstrainsAnalysis.h"
 #include "ast/analysis/typesystem/TypeConstraints.h"
@@ -122,9 +125,9 @@ Own<Clause> TypeAnalysis::createAnnotatedClause(
     return annotatedClause;
 }
 
-std::map<const Argument*, TypeSet> TypeAnalysis::analyseTypes(
-        const TranslationUnit& tu, const Clause& clause, std::ostream* logs) {
-    return TypeConstraintsAnalysis(tu).analyse(clause, logs);
+std::map<const Argument*, TypeSet> TypeAnalysis::analyseTypes(const TranslationUnit& tu, const Clause& clause,
+        TypeErrorAnalyzer* errorAnalyzer, std::ostream* logs) {
+    return TypeConstraintsAnalysis(tu).analyse(clause, errorAnalyzer, logs);
 }
 
 void TypeAnalysis::print(std::ostream& os) const {
@@ -185,6 +188,35 @@ std::vector<TypeAttribute> TypeAnalysis::getFunctorParamTypeAttributes(
         const UserDefinedFunctor& functor) const {
     assert(hasValidTypeInfo(functor) && "type of functor not processed");
     auto const& decl = functorAnalysis->getFunctorDeclaration(functor);
+    std::vector<TypeAttribute> res;
+    res.reserve(decl.getArity());
+    auto const& params = decl.getParams();
+    std::transform(params.begin(), params.end(), std::back_inserter(res),
+            [this](auto const& attr) { return nameToTypeAttribute(attr->getTypeName()); });
+    return res;
+}
+
+TypeAttribute TypeAnalysis::getAggregatorReturnTypeAttribute(const UserDefinedAggregator& aggregator) const {
+    return getTypeAttribute(getAggregatorReturnType(aggregator));
+}
+
+Type const& TypeAnalysis::getAggregatorReturnType(const UserDefinedAggregator& aggregator) const {
+    return nameToType(functorAnalysis->getFunctorDeclaration(aggregator).getReturnType().getTypeName());
+}
+
+Type const& TypeAnalysis::getAggregatorParamType(
+        const UserDefinedAggregator& aggregator, std::size_t idx) const {
+    return nameToType(functorAnalysis->getFunctorDeclaration(aggregator).getParams().at(idx)->getTypeName());
+}
+
+TypeAttribute TypeAnalysis::getAggregatorParamTypeAttribute(
+        const UserDefinedAggregator& aggregator, std::size_t idx) const {
+    return getTypeAttribute(getAggregatorParamType(aggregator, idx));
+}
+
+std::vector<TypeAttribute> TypeAnalysis::getAggregatorParamTypeAttributes(
+        const UserDefinedAggregator& aggregator) const {
+    auto const& decl = functorAnalysis->getFunctorDeclaration(aggregator);
     std::vector<TypeAttribute> res;
     res.reserve(decl.getArity());
     auto const& params = decl.getParams();
@@ -275,8 +307,15 @@ bool TypeAnalysis::hasValidTypeInfo(const Argument& argument) const {
         }
     } else if (auto* nc = as<NumericConstant>(argument)) {
         return contains(numericConstantType, nc);
-    } else if (auto* agg = as<Aggregator>(argument)) {
+    } else if (auto* agg = as<IntrinsicAggregator>(argument)) {
         return contains(aggregatorType, agg);
+    } else if (auto* uda = as<UserDefinedAggregator>(argument)) {
+        try {
+            auto const& declaration = functorAnalysis->getFunctorDeclaration(*uda);
+            return hasValidTypeInfo(declaration);
+        } catch (...) {  // functor hasn't been declared
+            return false;
+        }
     }
     return true;
 }
@@ -300,7 +339,7 @@ BinaryConstraintOp TypeAnalysis::getPolymorphicOperator(const BinaryConstraint& 
     return constraintType.at(&bc);
 }
 
-AggregateOp TypeAnalysis::getPolymorphicOperator(const Aggregator& agg) const {
+AggregateOp TypeAnalysis::getPolymorphicOperator(const IntrinsicAggregator& agg) const {
     assert(hasValidTypeInfo(agg) && "aggregator operator not set");
     return aggregatorType.at(&agg);
 }
@@ -381,7 +420,7 @@ bool TypeAnalysis::analyseAggregators(const TranslationUnit& translationUnit) {
     bool changed = false;
     const auto& program = translationUnit.getProgram();
 
-    auto setAggregatorType = [&](const Aggregator& agg, TypeAttribute attr) {
+    auto setAggregatorType = [&](const IntrinsicAggregator& agg, TypeAttribute attr) {
         auto overloadedType = convertOverloadedAggregator(agg.getBaseOperator(), attr);
         if (contains(aggregatorType, &agg) && aggregatorType.at(&agg) == overloadedType) {
             return;
@@ -390,7 +429,7 @@ bool TypeAnalysis::analyseAggregators(const TranslationUnit& translationUnit) {
         aggregatorType[&agg] = overloadedType;
     };
 
-    visit(program, [&](const Aggregator& agg) {
+    visit(program, [&](const IntrinsicAggregator& agg) {
         if (isOverloadedAggregator(agg.getBaseOperator())) {
             auto* targetExpression = agg.getTargetExpression();
             if (isFloat(targetExpression)) {
@@ -472,7 +511,8 @@ bool TypeAnalysis::isSymbol(const Argument* argument) const {
 void TypeAnalysis::run(const TranslationUnit& translationUnit) {
     // Check if debugging information is being generated
     std::ostream* debugStream = nullptr;
-    if (Global::config().has("debug-report") || Global::config().has("show", "type-analysis")) {
+    if (translationUnit.global().config().has("debug-report") ||
+            translationUnit.global().config().has("show", "type-analysis")) {
         debugStream = &analysisLogs;
     }
 
@@ -490,7 +530,8 @@ void TypeAnalysis::run(const TranslationUnit& translationUnit) {
 
         // Analyse general argument types, clause by clause.
         for (const Clause* clause : program.getClauses()) {
-            auto clauseArgumentTypes = analyseTypes(translationUnit, *clause, debugStream);
+            auto clauseArgumentTypes =
+                    analyseTypes(translationUnit, *clause, errorAnalyzer.get(), debugStream);
             argumentTypes.insert(clauseArgumentTypes.begin(), clauseArgumentTypes.end());
 
             if (debugStream != nullptr) {
@@ -729,7 +770,7 @@ void TypeAnnotationPrinter::print_(type_identity<BranchInit>, const BranchInit& 
 }
 
 void TypeAnnotationPrinter::print_(type_identity<Aggregator>, const Aggregator& agg) {
-    auto baseOperator = agg.getBaseOperator();
+    auto baseOperator = agg.getBaseOperatorName();
     auto bodyLiterals = agg.getBodyLiterals();
     os << baseOperator << " ";
     auto targetExpr = agg.getTargetExpression();
@@ -776,5 +817,10 @@ void TypeAnnotationPrinter::printAnnotatedClause(const Clause& clause) {
     }
     os << "." << std::endl;
 }
+
+TypeAnalysis::TypeAnalysis() : Analysis(name) {
+    errorAnalyzer = std::make_shared<TypeErrorAnalyzer>();
+}
+TypeAnalysis::~TypeAnalysis() = default;
 
 }  // namespace souffle::ast::analysis

@@ -39,45 +39,46 @@
 #include <memory>
 #include <utility>
 #include <vector>
+#ifndef _MSC_VER
+#include <unistd.h>
+#endif
 
-using YY_BUFFER_STATE = struct yy_buffer_state*;
 extern YY_BUFFER_STATE yy_scan_string(const char*, yyscan_t scanner);
 extern int yylex_destroy(yyscan_t scanner);
 extern int yylex_init_extra(ScannerInfo* data, yyscan_t* scanner);
-extern void yyset_in(FILE* in_str, yyscan_t scanner);
 extern void yyset_debug(int, yyscan_t scanner);
 
 namespace souffle {
 
-Own<ast::TranslationUnit> ParserDriver::parse(
-        const std::string& filename, FILE* in, ErrorReport& errorReport, DebugReport& debugReport) {
-    translationUnit = mk<ast::TranslationUnit>(mk<ast::Program>(), errorReport, debugReport);
-    yyscan_t scanner;
-    ScannerInfo data;
-    SrcLocation emptyLoc;
-    data.push(std::filesystem::weakly_canonical(filename).string(), emptyLoc);
-    yylex_init_extra(&data, &scanner);
-    yyset_debug(0, scanner);
-    yyset_in(in, scanner);
-
-    yy::parser parser(*this, scanner);
-    parser.parse();
-
-    yylex_destroy(scanner);
-
-    return std::move(translationUnit);
+ParserDriver::ParserDriver(Global& g) : glb(g) {
+    vfs = std::make_shared<RealFileSystem>();
 }
 
-Own<ast::TranslationUnit> ParserDriver::parse(
-        const std::string& code, ErrorReport& errorReport, DebugReport& debugReport) {
-    translationUnit = mk<ast::TranslationUnit>(mk<ast::Program>(), errorReport, debugReport);
+ParserDriver::ParserDriver(Global& g, std::shared_ptr<FileSystem> fs) : glb(g) {
+    if (fs) {
+        vfs = fs;
+    } else {
+        vfs = std::make_shared<RealFileSystem>();
+    }
+}
 
-    ScannerInfo data;
-    SrcLocation emptyLoc;
-    data.push("<in-memory>", emptyLoc);
+Own<ast::TranslationUnit> ParserDriver::parse(const std::string& filename, const std::string& code,
+        bool reducedConsecutiveNonLeadingWhitespaces, ErrorReport& errorReport, DebugReport& debugReport) {
+    translationUnit = mk<ast::TranslationUnit>(glb, mk<ast::Program>(), errorReport, debugReport);
     yyscan_t scanner;
+    ScannerInfo data(vfs);
+    SrcLocation emptyLoc;
+
+    std::filesystem::path filePath(filename);
+    if (vfs->exists(filename)) {
+        std::error_code ec;
+        filePath = vfs->canonical(filename, ec);
+    }
+    data.push(filePath, emptyLoc, reducedConsecutiveNonLeadingWhitespaces);
+
     yylex_init_extra(&data, &scanner);
     yyset_debug(0, scanner);
+
     yy_scan_string(code.c_str(), scanner);
     yy::parser parser(*this, scanner);
     parser.parse();
@@ -87,15 +88,81 @@ Own<ast::TranslationUnit> ParserDriver::parse(
     return std::move(translationUnit);
 }
 
-Own<ast::TranslationUnit> ParserDriver::parseTranslationUnit(
-        const std::string& filename, FILE* in, ErrorReport& errorReport, DebugReport& debugReport) {
-    ParserDriver parser;
-    return parser.parse(filename, in, errorReport, debugReport);
+Own<ast::TranslationUnit> ParserDriver::parseFromFS(
+        const std::filesystem::path& path, ErrorReport& errorReport, DebugReport& debugReport) {
+    translationUnit = mk<ast::TranslationUnit>(glb, mk<ast::Program>(), errorReport, debugReport);
+    yyscan_t scanner;
+    ScannerInfo data(vfs);
+    SrcLocation emptyLoc;
+
+    std::filesystem::path filePath(path);
+    if (!vfs->exists(filePath)) {
+        throw std::runtime_error(std::string("File does not exist: ") + filePath.string());
+    }
+
+    std::error_code ec;
+    filePath = vfs->canonical(filePath, ec);
+
+    yylex_init_extra(&data, &scanner);
+    yyset_debug(0, scanner);
+
+    auto code = readFile(filePath, ec);
+    if (ec) {
+        throw std::runtime_error(std::string("Cannot read file: ") + filePath.string());
+    }
+
+    data.push(filePath, emptyLoc);
+
+    yy_scan_string(code->c_str(), scanner);
+
+    yy::parser parser(*this, scanner);
+
+    parser.parse();
+
+    yylex_destroy(scanner);
+
+    return std::move(translationUnit);
 }
 
-Own<ast::TranslationUnit> ParserDriver::parseTranslationUnit(
+Own<ast::TranslationUnit> ParserDriver::parse(
         const std::string& code, ErrorReport& errorReport, DebugReport& debugReport) {
-    ParserDriver parser;
+    translationUnit = mk<ast::TranslationUnit>(glb, mk<ast::Program>(), errorReport, debugReport);
+
+    ScannerInfo data(vfs);
+    SrcLocation emptyLoc;
+    data.push("<in-memory>", emptyLoc);
+    data.setReported("<in-memory>");
+
+    yyscan_t scanner;
+    yylex_init_extra(&data, &scanner);
+    yyset_debug(0, scanner);
+
+    yy_scan_string(code.c_str(), scanner);
+    yy::parser parser(*this, scanner);
+    parser.parse();
+
+    yylex_destroy(scanner);
+
+    return std::move(translationUnit);
+}
+
+Own<ast::TranslationUnit> ParserDriver::parseTranslationUnit(Global& glb, const std::string& filename,
+        const std::string& code, bool reducedConsecutiveNonLeadingWhitespaces, ErrorReport& errorReport,
+        DebugReport& debugReport, std::shared_ptr<FileSystem> vfs) {
+    ParserDriver parser(glb, vfs);
+    return parser.parse(filename, code, reducedConsecutiveNonLeadingWhitespaces, errorReport, debugReport);
+}
+
+Own<ast::TranslationUnit> ParserDriver::parseTranslationUnitFromFS(Global& glb,
+        const std::filesystem::path& path, ErrorReport& errorReport, DebugReport& debugReport,
+        std::shared_ptr<FileSystem> vfs) {
+    ParserDriver parser(glb, vfs);
+    return parser.parseFromFS(path, errorReport, debugReport);
+}
+
+Own<ast::TranslationUnit> ParserDriver::parseTranslationUnit(Global& glb, const std::string& code,
+        ErrorReport& errorReport, DebugReport& debugReport, std::shared_ptr<FileSystem> vfs) {
+    ParserDriver parser(glb, vfs);
     return parser.parse(code, errorReport, debugReport);
 }
 
@@ -208,15 +275,16 @@ void ParserDriver::addIoFromDeprecatedTag(ast::Relation& rel) {
 
 std::set<RelationTag> ParserDriver::addDeprecatedTag(
         RelationTag tag, SrcLocation tagLoc, std::set<RelationTag> tags) {
-    if (!Global::config().has("legacy")) {
-        warning(tagLoc, tfm::format("Deprecated %s qualifier was used", tag));
+    if (!translationUnit->global().config().has("legacy")) {
+        warning(WarnType::DeprecatedQualifier, tagLoc, tfm::format("Deprecated %s qualifier was used", tag));
     }
     return addTag(tag, std::move(tagLoc), std::move(tags));
 }
 
 Own<ast::Counter> ParserDriver::addDeprecatedCounter(SrcLocation tagLoc) {
-    if (!Global::config().has("legacy")) {
-        warning(tagLoc, "Deprecated $ symbol was used. Use functor 'autoinc()' instead.");
+    if (!translationUnit->global().config().has("legacy")) {
+        warning(WarnType::DollarSign, tagLoc,
+                "Deprecated $ symbol was used. Use functor 'autoinc()' instead.");
     }
     return mk<ast::Counter>();
 }
@@ -243,14 +311,14 @@ std::set<RelationTag> ParserDriver::addTag(RelationTag tag, std::vector<Relation
 
 Own<ast::SubsetType> ParserDriver::mkDeprecatedSubType(
         ast::QualifiedName name, ast::QualifiedName baseTypeName, SrcLocation loc) {
-    if (!Global::config().has("legacy")) {
-        warning(loc, "Deprecated type declaration used");
+    if (!translationUnit->global().config().has("legacy")) {
+        warning(WarnType::DeprecatedTypeDecl, loc, "Deprecated type declaration used");
     }
     return mk<ast::SubsetType>(std::move(name), std::move(baseTypeName), std::move(loc));
 }
 
-void ParserDriver::warning(const SrcLocation& loc, const std::string& msg) {
-    translationUnit->getErrorReport().addWarning(msg, loc);
+void ParserDriver::warning(const WarnType type, const SrcLocation& loc, const std::string& msg) {
+    translationUnit->getErrorReport().addWarning(type, msg, loc);
 }
 void ParserDriver::error(const SrcLocation& loc, const std::string& msg) {
     translationUnit->getErrorReport().addError(msg, loc);
@@ -260,35 +328,52 @@ void ParserDriver::error(const std::string& msg) {
             Diagnostic(Diagnostic::Type::ERROR, DiagnosticMessage(msg)));
 }
 
+std::unique_ptr<std::string> ParserDriver::readFile(const std::filesystem::path& path, std::error_code& ec) {
+    return std::make_unique<std::string>(vfs->readFile(path, ec));
+}
+
 std::optional<std::filesystem::path> ParserDriver::searchIncludePath(
         const std::string& IncludeString, const SrcLocation& Loc) {
+    std::error_code ec;
     std::filesystem::path Request(IncludeString);
 
     if (Request.is_absolute()) {
-        if (std::filesystem::exists(Request)) {
-            return std::filesystem::canonical(Request);
+        if (vfs->exists(Request)) {
+            return vfs->canonical(Request, ec);
         } else {
             return std::nullopt;
         }
     }
 
-    // search relative from current input file
+    // search relative from current physical input file
     std::filesystem::path Candidate = std::filesystem::path(Loc.file->Physical).parent_path() / Request;
-    if (std::filesystem::exists(Candidate)) {
-        return std::filesystem::canonical(Candidate);
+    if (vfs->exists(Candidate)) {
+        return vfs->canonical(Candidate, ec);
     }
 
+#if defined(__APPLE__)
+    // work-around a bug in libcxx version <= 12, std::filesystem::current_path
+    // writes out of bound and corrupt memory.
+    char* cwd = ::getcwd(nullptr, 0);
+    if (cwd == nullptr) {
+        std::cerr << "Error: cannot get current working directory.\n";
+        return std::nullopt;
+    }
+    const std::filesystem::path CurrentWD = std::string(cwd);
+    free(cwd);
+#else
+    const std::filesystem::path CurrentWD = std::filesystem::current_path();
+#endif
+
     // search relative from include directories
-    for (auto&& includeDir : Global::config().getMany("include-dir")) {
+    for (auto&& includeDir : glb.config().getMany("include-dir")) {
         auto dir = std::filesystem::path(includeDir);
         if (dir.is_relative()) {
-            dir = (std::filesystem::current_path() / includeDir);
+            dir = (CurrentWD / dir);
         }
-        if (std::filesystem::exists(dir)) {
-            Candidate = std::filesystem::path(dir) / Request;
-            if (std::filesystem::exists(Candidate)) {
-                return std::filesystem::canonical(Candidate);
-            }
+        Candidate = std::filesystem::path(dir) / Request;
+        if (vfs->exists(Candidate)) {
+            return vfs->canonical(Candidate, ec);
         }
     }
 
@@ -296,7 +381,7 @@ std::optional<std::filesystem::path> ParserDriver::searchIncludePath(
 }
 
 bool ParserDriver::canEnterOnce(const SrcLocation& onceLoc) {
-    const auto Inserted = VisitedLocations.emplace(onceLoc.file->Physical, onceLoc.start.line);
+    const auto Inserted = VisitedOnceLocations.emplace(onceLoc.file->Physical, onceLoc.start.line);
     return Inserted.second;
 }
 

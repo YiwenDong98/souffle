@@ -38,13 +38,7 @@ namespace souffle::ast {
  */
 class Aggregator : public Argument {
 public:
-    Aggregator(AggregateOp baseOperator, Own<Argument> expr = {}, VecOwn<Literal> body = {},
-            SrcLocation loc = {});
-
-    /** Return the (base type) operator of the aggregator */
-    AggregateOp getBaseOperator() const {
-        return baseOperator;
-    }
+    Aggregator(Own<Argument> expr = {}, VecOwn<Literal> body = {}, SrcLocation loc = {});
 
     /** Return target expression */
     const Argument* getTargetExpression() const {
@@ -63,19 +57,10 @@ public:
 
     void apply(const NodeMapper& map) override;
 
+    virtual std::string getBaseOperatorName() const = 0;
+
 protected:
-    void print(std::ostream& os) const override;
-
     NodeVec getChildren() const override;
-
-private:
-    bool equal(const Node& node) const override;
-
-    Aggregator* cloning() const override;
-
-private:
-    /** Aggregate (base type) operator */
-    AggregateOp baseOperator;
 
     /** Aggregate expression */
     Own<Argument> targetExpression;
